@@ -592,3 +592,72 @@ fn the_laws_hold_over_every_triple_of_twelve_generated_states() {
         "only {nontrivial} of 1728 triples actually merged anything"
     );
 }
+
+/// A second witness of a decision already held must not rewrite the state.
+///
+/// The join keeps the INCUMBENT on an exact tie, and that is load-bearing
+/// rather than tidy: a decision has many possible witnesses — another signature
+/// over it, another stamp nonce, a different grant that admits the same signer
+/// — and if any of them displaced what is held, a key holder could make every
+/// host rewrite its state and wake every subscriber, for free, for ever.
+///
+/// This has to be tested at the JOIN. The `update_state` path drops an
+/// equal-ranked candidate in `absorb` before the join is reached, so a test
+/// through the contract interface passes whatever the join does with a tie —
+/// which is exactly how `>` becoming `>=` survived a mutation sweep.
+///
+/// Stated as "neither side is rewritten" rather than "both sides agree",
+/// because the two states are genuinely different encodings of one fact: each
+/// keeps its own witness, and that is the whole point.
+#[test]
+fn a_second_witness_of_a_held_decision_never_rewrites_the_state() {
+    let w = world();
+    let held = w.state(vec![w.item_full(1, b"k", 5, b"v", false, false, 0)]);
+
+    // Three ways to witness the same decision differently.
+    let other_nonce = w.state(vec![w.item_full(1, b"k", 5, b"v", false, false, 91)]);
+    let other_grant = {
+        let mut it = w.item_full(1, b"k", 5, b"v", false, false, 0);
+        // A narrower grant that still admits this bucket: a different witness
+        // of the same right, carried by the same item.
+        it.cap = Some(w.cap_for(1, 0, 9));
+        w.resign(&mut it, 1);
+        w.state(vec![it])
+    };
+
+    for (what, other) in [
+        ("another stamp nonce", other_nonce),
+        ("another grant", other_grant),
+    ] {
+        assert_ne!(
+            other.encode(),
+            held.encode(),
+            "{what}: the fixture must really be a different encoding"
+        );
+        assert_eq!(
+            other.decisions(),
+            held.decisions(),
+            "{what}: and the same decision"
+        );
+        assert_eq!(
+            join(&held, &other, &w.params).encode(),
+            held.encode(),
+            "{what}: merging it in rewrote the held state"
+        );
+        assert_eq!(
+            join(&other, &held, &w.params).encode(),
+            other.encode(),
+            "{what}: the other side was rewritten instead"
+        );
+    }
+
+    // Control: a decision that really is greater DOES replace the witness, so
+    // the four assertions above are about ties and not about the join refusing
+    // to update at all.
+    let newer = w.state(vec![w.item(1, b"k", 6, b"newer")]);
+    assert_ne!(
+        join(&held, &newer, &w.params).encode(),
+        held.encode(),
+        "a greater decision must replace what is held"
+    );
+}

@@ -716,9 +716,6 @@ impl SetState {
                 return None;
             }
             let h = Held::of(item, p, &ph);
-            if deny.iter().any(|d| d.signer == *h.item.signer.as_bytes()) {
-                return None;
-            }
             if let Some(prev) = held.last() {
                 if prev.rank() >= h.rank() {
                     return None;
@@ -731,6 +728,35 @@ impl SetState {
         }
         let s = SetState { deny, held };
         s.within_limits(p).then_some(s)
+    }
+
+    /// **The only way to read a Set's contents.** A denied signer's slots are
+    /// RETAINED in the state and hidden here; listing `held` directly shows
+    /// items the owner has denied.
+    ///
+    /// They are retained rather than removed because the merge has to be a
+    /// merge. A denial arrives later than the items it denies, and the capacity
+    /// cut discards the losers irrecoverably — so if the stored state omitted a
+    /// denied slot, that slot would stop consuming its place on a replica that
+    /// learned the denial early while still consuming it on one that learned it
+    /// late, and the two would disagree. Retained, the cut is a pure function of
+    /// the slot union everywhere, and the denial is a filter on the VIEW.
+    ///
+    /// The cost is that a denied signer's slots hold their places for the life
+    /// of the bucket. Bounded: at most `quota` of them, in the cap-holder tier
+    /// only, and their payloads are capped like any other. The owner's tier is
+    /// untouched. That is the price of a merge whose result does not depend on
+    /// the order the merges happened in.
+    pub fn visible(&self) -> impl Iterator<Item = &Held> {
+        self.held.iter().filter(|h| !self.is_denied(h))
+    }
+
+    /// Is this slot's signer denied? A denial is identified by WHO is denied,
+    /// and the list is sorted, so this is a binary search.
+    pub fn is_denied(&self, h: &Held) -> bool {
+        self.deny
+            .binary_search_by_key(h.item.signer.as_bytes(), |d| d.signer)
+            .is_ok()
     }
 
     /// The state as a set of FACTS, with every witness dropped: one

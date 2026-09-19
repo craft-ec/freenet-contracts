@@ -329,23 +329,16 @@ fn a_sealed_decision_is_not_superseded_by_a_later_unsealed_one() {
     assert!(done.held[0].item.tombstone, "a sealed tombstone must win");
 }
 
-/// A denial arrives AFTER the items it denies, and the cut throws information
-/// away — so the order of the two decides whether the merge is a merge.
+/// The two orderings of "cut" and "drop" that were tried and rejected.
 ///
-/// The spec said "DENY drops that signer's slots on merge" without saying where
-/// in the merge. Filtering before the cut is the obvious reading and it is not
-/// associative; the control below is that reading, and it fails. The contract
-/// cuts first and filters after.
-mod deny_before_cut_control {
+/// Both are implemented here and both are shown to disagree with themselves on
+/// some placement of the denial. Without them this file would assert only that
+/// the shipped rule works, and a rule that did nothing would pass that.
+mod dropping_controls {
     use super::*;
     use craftec_set_contract::merge::cut;
 
-    /// The rejected order: drop the denied, THEN cut to capacity.
-    pub fn join_filter_first(a: &SetState, b: &SetState, p: &Params) -> SetState {
-        let mut deny = a.deny.clone();
-        deny.extend(b.deny.iter().cloned());
-        deny.sort_by_key(|d| d.signer);
-        deny.dedup_by(|x, y| x.signer == y.signer);
+    fn slot_union(a: &SetState, b: &SetState) -> Vec<Held> {
         let mut slots: Vec<Held> = Vec::new();
         for h in a.held.iter().chain(b.held.iter()) {
             match slots.iter().position(|s| s.slot == h.slot) {
@@ -357,70 +350,159 @@ mod deny_before_cut_control {
                 }
             }
         }
-        slots.retain(|h| {
-            deny.binary_search_by_key(h.item.signer.as_bytes(), |d| d.signer)
-                .is_err()
-        });
+        slots
+    }
+
+    fn denies(deny: &[craftec_set_contract::wire::Deny], h: &Held) -> bool {
+        deny.binary_search_by_key(h.item.signer.as_bytes(), |d| d.signer)
+            .is_ok()
+    }
+
+    fn deny_union(a: &SetState, b: &SetState) -> Vec<craftec_set_contract::wire::Deny> {
+        let mut d = a.deny.clone();
+        d.extend(b.deny.iter().cloned());
+        d.sort_by_key(|x| x.signer);
+        d.dedup_by(|x, y| x.signer == y.signer);
+        d
+    }
+
+    /// Rejected order 1: drop the denied, then cut to capacity.
+    pub fn drop_then_cut(a: &SetState, b: &SetState, p: &Params) -> SetState {
+        let deny = deny_union(a, b);
+        let mut slots = slot_union(a, b);
+        slots.retain(|h| !denies(&deny, h));
         let mut held = cut(slots, p);
+        held.sort_by_key(|h| h.rank());
+        SetState { deny, held }
+    }
+
+    /// Rejected order 2: cut to capacity, then drop the denied.
+    pub fn cut_then_drop(a: &SetState, b: &SetState, p: &Params) -> SetState {
+        let deny = deny_union(a, b);
+        let mut held = cut(slot_union(a, b), p);
+        held.retain(|h| !denies(&deny, h));
         held.sort_by_key(|h| h.rank());
         SetState { deny, held }
     }
 }
 
+/// A denial must give the same answer wherever it sits among the operands.
+///
+/// Both rejected orders are run over every placement first and each is shown to
+/// disagree with itself on at least one of them — which is the whole finding:
+/// the first version of this contract dropped denied slots and tested only the
+/// placement where the denial came LAST, and that is the one placement where
+/// cut-then-drop happens to be right.
 #[test]
-fn a_denial_arriving_later_cannot_depend_on_the_order_of_merges() {
-    // M = 1: the single place is what the two slots compete for.
+fn a_denial_gives_one_answer_wherever_it_sits_among_the_operands() {
     let w = world_with(7, 4, Admission::Cap, 1, 1, 0);
     let ph = w.ph();
-    // Two slots, and we need to know which one the cut prefers.
-    let x = w.item(1, b"x", 1, b"from the signer who gets denied");
-    let y = w.item(2, b"y", 1, b"from an honest signer");
-    let (hx, hy) = (
-        Held::of(x.clone(), &w.params, &ph),
-        Held::of(y.clone(), &w.params, &ph),
+    let a = w.item(1, b"x", 1, b"from the signer who gets denied");
+    let b = w.item(2, b"y", 1, b"from an honest signer");
+    let (ha, hb) = (
+        Held::of(a.clone(), &w.params, &ph),
+        Held::of(b.clone(), &w.params, &ph),
     );
-    // The fixture only bites when the DENIED slot is the one the cut keeps.
-    let (denied_who, keep, other) = if hx.rank() < hy.rank() {
-        (1, x, y)
+    // The fixture bites only when the DENIED slot is the one the cut prefers.
+    let (denied_who, x, y) = if ha.rank() < hb.rank() {
+        (1, a, b)
     } else {
-        (2, y, x)
+        (2, b, a)
     };
-    let a = w.state(vec![keep]);
-    let b = w.state(vec![other]);
+    let sx = w.state(vec![x]);
+    let sy = w.state(vec![y]);
     let c = SetState {
         deny: vec![w.deny_of(denied_who)],
         held: Vec::new(),
     };
 
-    // The control: filtering before the cut gives two different answers.
-    let left = deny_before_cut_control::join_filter_first(
-        &deny_before_cut_control::join_filter_first(&a, &b, &w.params),
-        &c,
-        &w.params,
+    // Every association of every ordering of the three operands.
+    let placements = |j: &dyn Fn(&SetState, &SetState, &Params) -> SetState| {
+        let mut out = Vec::new();
+        for (p, q, r) in [
+            (&sx, &sy, &c),
+            (&sx, &c, &sy),
+            (&sy, &sx, &c),
+            (&sy, &c, &sx),
+            (&c, &sx, &sy),
+            (&c, &sy, &sx),
+        ] {
+            out.push(j(&j(p, q, &w.params), r, &w.params).decisions());
+            out.push(j(p, &j(q, r, &w.params), &w.params).decisions());
+        }
+        out
+    };
+
+    for (what, control) in [
+        (
+            "drop then cut",
+            &dropping_controls::drop_then_cut as &dyn Fn(&SetState, &SetState, &Params) -> SetState,
+        ),
+        ("cut then drop", &dropping_controls::cut_then_drop),
+    ] {
+        let got = placements(control);
+        assert!(
+            got.iter().any(|r| *r != got[0]),
+            "{what} must disagree with itself somewhere, or this test proves nothing"
+        );
+    }
+
+    // The rule in force agrees on all twelve.
+    let got = placements(&|a, b, p| join(a, b, p));
+    for (i, r) in got.iter().enumerate() {
+        assert_eq!(*r, got[0], "placement {i} disagrees");
+    }
+    // And the denied slot is retained but invisible, wherever it landed.
+    let merged = join(&join(&sx, &c, &w.params), &sy, &w.params);
+    let denied_key = w.keys[denied_who].verifying_key().to_bytes();
+    assert!(
+        merged
+            .held
+            .iter()
+            .any(|h| *h.item.signer.as_bytes() == denied_key),
+        "the denied slot must be RETAINED, or the cut is not a function of the slots"
     );
-    let right = deny_before_cut_control::join_filter_first(
-        &a,
-        &deny_before_cut_control::join_filter_first(&b, &c, &w.params),
-        &w.params,
+    assert!(
+        !merged
+            .visible()
+            .any(|h| *h.item.signer.as_bytes() == denied_key),
+        "a denied signer's item was visible to a reader"
     );
-    assert_ne!(
-        left.decisions(),
-        right.decisions(),
-        "filter-then-cut must fail here, or this test proves nothing"
+}
+
+/// `visible()` is the only reader-facing view, and it must hide a denied
+/// signer's items whether they arrived before the denial or after it.
+#[test]
+fn a_denied_signers_items_are_retained_and_hidden_whenever_they_arrive() {
+    let w = world();
+    let before = w.state(vec![
+        w.item(1, b"early", 1, b"v"),
+        w.item(2, b"keep", 1, b"v"),
+    ]);
+    let denial = SetState {
+        deny: vec![w.deny_of(1)],
+        held: Vec::new(),
+    };
+    let after = join(
+        &join(&before, &denial, &w.params),
+        &w.state(vec![w.item(1, b"late", 9, b"written after the denial")]),
+        &w.params,
     );
 
-    // The order in force agrees whichever way the merges associate.
-    let left = join(&join(&a, &b, &w.params), &c, &w.params);
-    let right = join(&a, &join(&b, &c, &w.params), &w.params);
-    assert_eq!(left.decisions(), right.decisions(), "not associative");
-    // And in both, the denied signer is gone.
-    for s in [&left, &right] {
-        assert!(
-            !s.held
-                .iter()
-                .any(|h| *h.item.signer.as_bytes() == w.keys[denied_who].verifying_key().to_bytes()),
-            "a denied signer's slot survived the merge"
-        );
+    assert_eq!(after.held.len(), 3, "every slot must be retained");
+    let visible: Vec<&[u8]> = after
+        .visible()
+        .map(|h| h.item.item_key.as_slice())
+        .collect();
+    assert_eq!(
+        visible,
+        vec![b"keep".as_slice()],
+        "only the undenied signer is visible"
+    );
+    // Both the early and the late item are there, and both are hidden.
+    for key in [b"early".as_slice(), b"late".as_slice()] {
+        assert!(after.held.iter().any(|h| h.item.item_key == key));
+        assert!(!after.visible().any(|h| h.item.item_key == key));
     }
 }
 
@@ -439,7 +521,74 @@ fn denials_union_and_survive_re_signing() {
         both.decisions(),
         "and the union must not depend on the order"
     );
-    // The same denial again, and the facts are unchanged.
     let again = join(&both, &w.state_with(vec![], vec![w.deny_of(1)]), &w.params);
     assert_eq!(again.decisions(), both.decisions());
+}
+
+/// The laws over GENERATED states, denials included — because a hand-picked
+/// triple is how two people in a row missed a case.
+///
+/// Twelve states built from a shared pool of overlapping slots, competing
+/// versions, tombstones, seals and two denials, at a capacity small enough that
+/// the cut is live in nearly every merge: 1,728 triples, each checked for
+/// associativity, and every pair for commutativity.
+#[test]
+fn the_laws_hold_over_every_triple_of_twelve_generated_states() {
+    let w = world_with(11, 4, Admission::Cap, 2, 2, 0);
+    let pool: Vec<Item> = vec![
+        w.item(0, b"a", 3, b"a3"),
+        w.item(0, b"a", 7, b"a7"),
+        w.item(1, b"b", 2, b"b2"),
+        w.tombstone(1, b"b", 5),
+        w.sealed(1, b"c", 4, b"c4"),
+        w.item(1, b"c", 900, b"late edit of a sealed slot"),
+        w.item(2, b"d", 1, b"d1"),
+        w.item(2, b"e", 6, b"e6"),
+        w.item(3, b"f", 8, b"f8"),
+    ];
+    let denials = [w.deny_of(1), w.deny_of(2)];
+    let mut states: Vec<SetState> = Vec::new();
+    states.push(SetState::default());
+    for i in 0..pool.len() {
+        // Overlapping windows, so states share slots rather than partition them.
+        let items: Vec<Item> = (0..3).map(|k| pool[(i + k) % pool.len()].clone()).collect();
+        let deny = match i % 4 {
+            1 => vec![denials[0].clone()],
+            2 => vec![denials[1].clone()],
+            3 => vec![denials[0].clone(), denials[1].clone()],
+            _ => Vec::new(),
+        };
+        states.push(w.state_with(items, deny));
+    }
+    states.push(w.state_with(vec![], vec![denials[0].clone()]));
+    states.push(w.state_with(vec![], vec![denials[1].clone()]));
+    assert_eq!(states.len(), 12);
+
+    let mut nontrivial = 0;
+    for a in &states {
+        assert_eq!(
+            join(a, a, &w.params).decisions(),
+            a.decisions(),
+            "idempotence"
+        );
+        for b in &states {
+            assert_eq!(
+                join(a, b, &w.params).decisions(),
+                join(b, a, &w.params).decisions(),
+                "commutativity"
+            );
+            for c in &states {
+                let l = join(&join(a, b, &w.params), c, &w.params);
+                let r = join(a, &join(b, c, &w.params), &w.params);
+                assert_eq!(l.decisions(), r.decisions(), "associativity");
+                if l.decisions() != a.decisions() && l.decisions() != c.decisions() {
+                    nontrivial += 1;
+                }
+            }
+        }
+    }
+    assert!(
+        nontrivial > 1000,
+        "only {nontrivial} of 1728 triples actually merged anything"
+    );
 }

@@ -5,8 +5,15 @@
 //! State  = `"ST01" ‖ deny count ‖ deny* ‖ item count ‖ item*`, in rank order.
 //! Valid  = every signature in it verifies under the params, every encoding is
 //!          the canonical one, and the limits hold.
-//! Merge  = union the slots, keep the best DECISION in each, cut to capacity,
-//!          then drop the denied — a semilattice on decisions (`crate::merge`).
+//! Merge  = union the slots, keep the best DECISION in each, cut to capacity
+//!          — a semilattice on decisions (`crate::merge`).
+//! Read   = [`wire::SetState::visible`], never `held` directly. A denied
+//!          signer's slots are RETAINED in the state and hidden from readers,
+//!          because a denial arrives later than the items it denies and the
+//!          capacity cut discards its losers irrecoverably: a state that
+//!          omitted the denied slot would have it consume a place on replicas
+//!          that learned the denial late and not on those that learned it
+//!          early, and the merge would stop being a merge.
 //!
 //! **The one thing a Set asserts is that every item in it was signed by its
 //! slot's key.** Validation therefore verifies every signature, every time. It
@@ -365,11 +372,11 @@ mod tests {
         .encode();
         let after = update_with(&w.params_bytes, &held, vec![real]);
         let (_, s) = read(&w.params_bytes, &after).unwrap();
-        assert!(
-            s.held.is_empty(),
-            "the owner's denial did not drop the item"
-        );
         assert_eq!(s.deny.len(), 1);
+        // Retained, so the capacity cut stays a function of the slot union on
+        // every replica; hidden, so no reader sees it.
+        assert_eq!(s.held.len(), 1, "the slot must be retained");
+        assert_eq!(s.visible().count(), 0, "and invisible to a reader");
     }
 
     #[test]

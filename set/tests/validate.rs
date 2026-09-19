@@ -320,7 +320,7 @@ fn params_are_refused_unless_canonical() {
 }
 
 #[test]
-fn a_denied_signers_item_cannot_be_in_a_valid_state() {
+fn a_denied_signers_item_is_retained_in_the_state_and_hidden_from_readers() {
     let w = world();
     let it = w.item(1, b"k", 1, b"v");
     // Control: without the denial the state is fine.
@@ -329,12 +329,14 @@ fn a_denied_signers_item_cannot_be_in_a_valid_state() {
         &w.encode(&w.state(vec![it.clone()]))
     ));
 
+    // A state holding a denied signer's item is VALID: the slot is retained so
+    // that the capacity cut is a function of the slot union on every replica.
+    // What denial changes is the VIEW.
     let mut s = w.state(vec![it]);
     s.deny = vec![w.deny_of(1)];
-    assert!(
-        !valid(&w.params_bytes, &s.encode()),
-        "a state holding a denied signer's item must be refused"
-    );
+    let (_, parsed) = read(&w.params_bytes, &s.encode()).expect("retained, not refused");
+    assert_eq!(parsed.held.len(), 1);
+    assert_eq!(parsed.visible().count(), 0, "a denied item was visible");
 
     // A denial has to be the owner's, and it has to be for THIS set.
     let forged = SetState {

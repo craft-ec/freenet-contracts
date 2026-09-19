@@ -74,29 +74,39 @@ pub fn cut(mut slots: Vec<Held>, p: &Params) -> Vec<Held> {
     kept
 }
 
-/// `union the slots, best decision per slot, cut, then drop the denied`.
+/// `union the slots, best decision per slot, cut`. Denials do not enter this.
 ///
-/// **Why the cut runs BEFORE the denial filter, which is not the obvious
-/// order.** A denial arrives later than the items it denies, and the cut throws
-/// information away. Filter first and the join stops being associative — with
-/// `M = 1`, slot `x` (denied later by `C`) and slot `y`:
+/// **A denied slot is RETAINED and hidden, never dropped from the state**, and
+/// that is forced rather than chosen. A denial arrives later than the items it
+/// denies, and the capacity cut discards its losers irrecoverably. Whichever
+/// way a dropping join is ordered, some triple disagrees with itself:
 ///
 /// ```text
-///   J(J({x},{y}), C) : the cut keeps x, C then denies it            → {}
-///   J({x}, J({y},C)) : {y} survives, the cut keeps x, C denies it   → {y}
+/// drop, then cut — with M = 1, x denied later by C:
+///   J(J({x},{y}), C) → {}        J({x}, J({y},C)) → {y}
+/// cut, then drop — the same three facts, the denial moved inwards:
+///   J(J({x},C), {y}) → {y}       J({x}, J(C,{y})) → {}
 /// ```
 ///
-/// Two answers for one set of facts, which is the same shape of bug the
-/// version-ranked rank had. Cutting first makes the cut a pure function of the
-/// slot union, and the denial a monotone filter applied to its result, so both
-/// orders give `{}`.
+/// The cause is common to both: if the stored state omits the denied slot, the
+/// slot stops consuming its place on a replica that learned the denial early
+/// and still consumes it on one that learned it late. No ordering of "cut" and
+/// "drop" repairs that, because the cut has already thrown `y` away and a
+/// removal cannot bring it back.
 ///
-/// It is not free: while a pre-denial replica still exists, merging with it
-/// re-introduces the denied slot, which consumes a place in the cut and is then
-/// dropped — so a full set can lose one good slot per denied slot, per merge
-/// with a stale replica. Bounded by the number of denials, and it stops when
-/// the last stale replica has merged. The alternative was a merge whose result
-/// depends on the order the merges happened in, which is not a merge.
+/// So the state keeps the slot — the whole signed item, not a placeholder:
+/// a placeholder would not be self-certifying, and anyone could then fabricate
+/// top-ranked "denied" slots to starve the Set. The cut becomes a pure function
+/// of the slot union on every replica, the deny set is an independent grow-only
+/// union, and the join is the product of two semilattices. What a READER sees
+/// is [`SetState::visible`].
+///
+/// This also settles what happens to a denied signer's LATER items: they are
+/// admitted, retained and hidden, exactly like its earlier ones, and they count
+/// in the cut. Refusing them at admission would make a slot's existence depend
+/// on whether the denial had arrived yet, which is the same order-dependence by
+/// another route. A denied signer can therefore hold its `quota` of places in
+/// the cap-holder tier for the life of the bucket, and no more.
 pub fn join(a: &SetState, b: &SetState, p: &Params) -> SetState {
     let mut deny: Vec<Deny> = Vec::with_capacity(a.deny.len() + b.deny.len());
     deny.extend(a.deny.iter().cloned());
@@ -120,10 +130,6 @@ pub fn join(a: &SetState, b: &SetState, p: &Params) -> SetState {
     }
 
     let mut held = cut(slots, p);
-    held.retain(|h| {
-        deny.binary_search_by_key(h.item.signer.as_bytes(), |d| d.signer)
-            .is_err()
-    });
     held.sort_by_key(|h| h.rank());
     SetState { deny, held }
 }

@@ -784,7 +784,19 @@ mod pack_tests {
             out_of_order.extend_from_slice(&(body.len() as u32).to_le_bytes());
             out_of_order.extend_from_slice(body);
         }
-        let duplicate = build(&[raw(b"same"), raw(b"same")]);
+        // Built by hand: `build` folds a repeated member into one, so a
+        // fixture made through the builder can no longer express what the
+        // builder refuses to produce.
+        let duplicate = {
+            let mut b = Vec::from(&pack::MAGIC[..]);
+            b.extend_from_slice(&2u16.to_le_bytes());
+            for _ in 0..2 {
+                b.push(kind::RAW);
+                b.extend_from_slice(&4u32.to_le_bytes());
+                b.extend_from_slice(b"same");
+            }
+            b
+        };
 
         for (what, body) in [
             ("no magic", bad_magic),
@@ -836,6 +848,27 @@ mod pack_tests {
 
     /// A body over the pack ceiling is refused, and the ceiling is per KIND:
     /// the same length as a RAW block is refused far sooner.
+    /// A pack is a SET, so the builder must fold a block offered twice into
+    /// one member — otherwise it hands its caller bytes the contract refuses.
+    #[test]
+    fn the_builder_folds_a_repeated_member_into_one() {
+        let once = state_of(&[raw(b"one"), raw(b"two")]);
+        let twice = state_of(&[raw(b"two"), raw(b"one"), raw(b"one"), raw(b"two")]);
+        assert_eq!(twice, once, "the same set must build the same bytes");
+        assert!(accepted_at_every_door(&twice));
+        // The control: a duplicate reaching the wire IS refused, so the
+        // assertion above is about the builder and not about duplicates being
+        // harmless.
+        let mut forged = Vec::from(&pack::MAGIC[..]);
+        forged.extend_from_slice(&2u16.to_le_bytes());
+        for _ in 0..2 {
+            forged.push(kind::RAW);
+            forged.extend_from_slice(&3u32.to_le_bytes());
+            forged.extend_from_slice(b"one");
+        }
+        assert!(!accepted_at_every_door(&encode(kind::PACK, &forged)));
+    }
+
     #[test]
     fn the_size_ceiling_is_per_kind() {
         let at_cap = encode(kind::RAW, &vec![0u8; MAX_BODY]);

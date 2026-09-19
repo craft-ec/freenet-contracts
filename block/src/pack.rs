@@ -160,12 +160,18 @@ pub fn well_formed(body: &[u8]) -> bool {
 
 /// Build a pack body from members, ordering them as the format requires.
 ///
-/// For callers assembling one and for the tests. It does not check the members
-/// — `well_formed` decides, and a builder that refused early would hide the
-/// cases the tests exist to reach.
+/// A pack is a SET, so the same block offered twice is one member: sorting
+/// without de-duplicating would hand the caller bytes the contract refuses.
+/// De-duplication is by block id, which is what the order is over and what
+/// "the same block" means here — two members with the same id ARE the same
+/// bytes.
+///
+/// It does not otherwise check the members: `well_formed` decides, and a
+/// builder that refused early would hide the cases the tests exist to reach.
 pub fn build(members: &[(u8, Vec<u8>)]) -> Vec<u8> {
     let mut ordered: Vec<&(u8, Vec<u8>)> = members.iter().collect();
     ordered.sort_by_key(|(k, b)| freenet_prolly::block_id(*k, b));
+    ordered.dedup_by_key(|(k, b)| freenet_prolly::block_id(*k, b));
     let mut out = Vec::from(&MAGIC[..]);
     out.extend_from_slice(&(ordered.len() as u16).to_le_bytes());
     for (k, b) in ordered {

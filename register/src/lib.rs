@@ -20,6 +20,10 @@
 use freenet_stdlib::prelude::*;
 
 pub mod merge;
+/// Naming a successor. Native-only: no host calls it, and register.wasm
+/// must not move for a helper.
+#[cfg(not(target_arch = "wasm32"))]
+pub mod succ;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 pub mod wire;
@@ -895,8 +899,8 @@ mod tests {
         assert_eq!(after, forked, "and it must change nothing");
     }
 
-    /// A terminal record's value is the successor's contract instance id, so its
-    /// length is part of the format.
+    /// A terminal record's value is the successor's IDENTITY, so its length is
+    /// part of the format.
     #[test]
     fn a_terminal_value_must_be_exactly_32_bytes() {
         let w = world();

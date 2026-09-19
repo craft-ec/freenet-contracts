@@ -204,6 +204,68 @@ mod tests {
         );
     }
 
+    /// The value-hash step is load-bearing, and the record-hash step cannot
+    /// stand in for it. Both give a total order, so convergence alone cannot
+    /// tell them apart — but they decide DIFFERENT THINGS. With the value hash
+    /// first, which VALUE wins a fork is fixed the moment both values exist, and
+    /// only its encoding can still change. With the record hash deciding between
+    /// values, the winning value flips whenever anyone publishes a new
+    /// signer-subset encoding of the losing value: A signed by {0,1} beats B,
+    /// then B signed by {1,2} beats A, for as long as anyone keeps signing.
+    #[test]
+    fn which_value_wins_a_fork_does_not_depend_on_who_signed_it() {
+        let w = world();
+        // Two values at one seq, `lo` being the one with the lower value hash.
+        let (lo, hi) = {
+            let (a, b) = (b"value-alpha".to_vec(), b"value-beta".to_vec());
+            if blake3::hash(&a).as_bytes() <= blake3::hash(&b).as_bytes() {
+                (a, b)
+            } else {
+                (b, a)
+            }
+        };
+        let winners = w.all_encodings(false, 5, &lo);
+        let losers = w.all_encodings(false, 5, &hi);
+        assert_eq!(
+            (winners.len(), losers.len()),
+            (6, 6),
+            "2 of 4 has six quorums"
+        );
+
+        // Only worth running where the two orders DISAGREE: some encoding of the
+        // losing value must hash below some encoding of the winning one, so that
+        // a record-hash-first order would pick the loser.
+        let disagree = losers.iter().any(|l| {
+            winners
+                .iter()
+                .any(|win| record_hash(l, &w.auth) < record_hash(win, &w.auth))
+        });
+        assert!(
+            disagree,
+            "no pair of subsets separates the two orders, so this proves nothing"
+        );
+
+        // Whoever signed either side, the lower value hash wins.
+        for win in &winners {
+            for lose in &losers {
+                let m = update(&w.state(win.clone()), &w.state(lose.clone()), &w.auth);
+                assert!(m.forked(), "same seq, different values");
+                assert_eq!(
+                    m.record.as_ref().unwrap().value,
+                    lo,
+                    "the winning value must not depend on who signed it"
+                );
+            }
+        }
+
+        // And publishing further encodings of the loser never moves it.
+        let mut held = w.state(winners[0].clone());
+        for lose in &losers {
+            held = update(&held, &w.state(lose.clone()), &w.auth);
+            assert_eq!(held.record.as_ref().unwrap().value, lo);
+        }
+    }
+
     #[test]
     fn a_terminal_record_can_never_be_displaced() {
         let w = world();

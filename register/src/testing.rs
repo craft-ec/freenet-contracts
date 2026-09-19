@@ -125,6 +125,30 @@ impl World {
         })
     }
 
+    /// Every way to choose `k` of the `n` signers, in index order.
+    pub fn subsets(&self) -> Vec<Vec<usize>> {
+        let n = match &self.auth {
+            Authority::One(_) => 1,
+            Authority::Quorum { keys, .. } => keys.len(),
+        };
+        let mut out = Vec::new();
+        for mask in 0u32..(1 << n) {
+            if mask.count_ones() as usize == self.k {
+                out.push((0..n).filter(|i| mask & (1 << i) != 0).collect());
+            }
+        }
+        out
+    }
+
+    /// Every encoding of one decision: the same `(terminal, seq, value)` signed
+    /// by each possible quorum.
+    pub fn all_encodings(&self, terminal: bool, seq: u64, value: &[u8]) -> Vec<Record> {
+        self.subsets()
+            .into_iter()
+            .map(|who| self.record_signed_by(terminal, seq, value, &who))
+            .collect()
+    }
+
     pub fn state(&self, r: Record) -> RegState {
         RegState {
             record: Some(r),

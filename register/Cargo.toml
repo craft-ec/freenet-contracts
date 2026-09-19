@@ -15,7 +15,11 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 freenet-stdlib = { version = "0.10.0", features = ["contract"] }
 blake3 = { version = "1", default-features = false }
-ed25519-dalek = { version = "2", default-features = false }
+# Pinned exactly, not by range: the wasm hash depends on this crate, and
+# `default-features = false` is what selects the full `S < L` scalar check over
+# the three-bit legacy one. A lockfile regeneration must not be able to move
+# strict-verification behaviour underneath a published contract key.
+ed25519-dalek = { version = "=2.2.0", default-features = false }
 
 [features]
 default = ["freenet-main-contract"]

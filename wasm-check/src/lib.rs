@@ -485,3 +485,114 @@ pub extern "C" fn set_accepts_good_refuses_corrupt(h: u32) -> u32 {
     let refused = craftec_set_contract::read(&c.params, &bad).is_none();
     u32::from(good && refused)
 }
+
+// ---------------------------------------------------------------- PACK ----
+//
+// What a pack costs a host to validate, at the two ends of the format.
+//
+// "MAX_PACK with minimum-size members" is NOT reachable, and the reason is
+// worth knowing: `count` is a u16, so a pack holds at most 65,535 members, and
+// members must be DISTINCT (strictly ascending by block id), so all-empty
+// bodies are one member, not many. The most per-member work a pack can ask for
+// is therefore 65,535 members with the smallest distinct bodies — about 459 KB,
+// not a megabyte. The megabyte end is reached the other way, with few large
+// members, which costs far less because the work is per MEMBER.
+
+struct PackCase {
+    params: Vec<u8>,
+    state: Vec<u8>,
+    members: u32,
+}
+
+static mut PACK_CASES: Vec<PackCase> = Vec::new();
+
+fn pack_push(members: Vec<(u8, Vec<u8>)>) -> u32 {
+    use craftec_block_contract::{encode, kind, pack::build};
+    let n = members.len() as u32;
+    let state = encode(kind::PACK, &build(&members).expect("a buildable pack"));
+    let case = PackCase {
+        params: freenet_prolly::block_id(kind::PACK, &build(&members).expect("a buildable pack")).to_vec(),
+        state,
+        members: n,
+    };
+    unsafe {
+        let v = &mut *core::ptr::addr_of_mut!(PACK_CASES);
+        v.push(case);
+        (v.len() - 1) as u32
+    }
+}
+
+/// The most members the format allows, with the smallest distinct bodies.
+#[no_mangle]
+pub extern "C" fn pack_prepare_many() -> u32 {
+    use craftec_block_contract::kind;
+    let members: Vec<(u8, Vec<u8>)> = (0..u16::MAX as u32)
+        .map(|i| (kind::RAW, (i as u16).to_le_bytes().to_vec()))
+        .collect();
+    pack_push(members)
+}
+
+/// The most BYTES the format allows, in the largest members.
+#[no_mangle]
+pub extern "C" fn pack_prepare_large() -> u32 {
+    use craftec_block_contract::{kind, pack::MAX_PACK, MAX_BODY};
+    // As close to the ceiling as the format allows: as many full-size members
+    // as fit, then one sized to the remainder. Four MAX_BODY members would be
+    // 1,048,832 B of bodies alone, which is OVER MAX_PACK — the pack would not
+    // validate at all, and a timing run over a refused input measures nothing.
+    let mut members: Vec<(u8, Vec<u8>)> = Vec::new();
+    let mut used = 6usize; // the header
+    for i in 0..u8::MAX {
+        let room = MAX_PACK - used;
+        if room < 5 + 1 {
+            break;
+        }
+        let len = MAX_BODY.min(room - 5);
+        let mut b = vec![0xab; len];
+        b[0] = i;
+        used += 5 + len;
+        members.push((kind::RAW, b));
+        if len < MAX_BODY {
+            break;
+        }
+    }
+    pack_push(members)
+}
+
+fn pack_case(h: u32) -> &'static PackCase {
+    unsafe { &(&*core::ptr::addr_of!(PACK_CASES))[h as usize] }
+}
+
+#[no_mangle]
+pub extern "C" fn pack_members(h: u32) -> u32 {
+    pack_case(h).members
+}
+
+#[no_mangle]
+pub extern "C" fn pack_state_len(h: u32) -> u32 {
+    pack_case(h).state.len() as u32
+}
+
+#[no_mangle]
+pub extern "C" fn pack_validate_n(h: u32, runs: u32) -> u32 {
+    let c = pack_case(h);
+    let mut ok = 0;
+    for _ in 0..runs {
+        if craftec_block_contract::check(&c.params, &c.state) {
+            ok += 1;
+        }
+    }
+    ok
+}
+
+/// The control: a pack that should not validate must not.
+#[no_mangle]
+pub extern "C" fn pack_accepts_good_refuses_corrupt(h: u32) -> u32 {
+    let c = pack_case(h);
+    let good = craftec_block_contract::check(&c.params, &c.state);
+    let mut bad = c.state.clone();
+    let at = bad.len() / 2;
+    bad[at] ^= 0x01;
+    let refused = !craftec_block_contract::check(&c.params, &bad);
+    u32::from(good && refused)
+}

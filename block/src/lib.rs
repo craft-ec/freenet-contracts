@@ -9,10 +9,70 @@
 
 use freenet_stdlib::prelude::*;
 
+pub mod pack;
+
+/// Work a state can ask a host for, counted so the price of REFUSING one can be
+/// asserted rather than argued.
+///
+/// At the crate root because it spans the kinds: a pack's members and a tree
+/// node are both work a stranger can try to buy with bytes that do not hash to
+/// the key they arrived under. Thread-local — the harness runs tests on many
+/// threads, and a process-global counter reports every thread's work to every
+/// reader.
+#[cfg(any(test, feature = "testing"))]
+pub mod work {
+    use core::cell::Cell;
+    thread_local! {
+        static IDS: Cell<usize> = const { Cell::new(0) };
+        static BODIES: Cell<usize> = const { Cell::new(0) };
+        static NODES: Cell<usize> = const { Cell::new(0) };
+    }
+    /// Member ids hashed on this thread since [`reset`].
+    pub fn ids() -> usize {
+        IDS.with(|n| n.get())
+    }
+    /// Member bodies checked for well-formedness since [`reset`].
+    pub fn bodies() -> usize {
+        BODIES.with(|n| n.get())
+    }
+    /// Tree nodes parsed and boundary-checked since [`reset`].
+    pub fn nodes() -> usize {
+        NODES.with(|n| n.get())
+    }
+    pub fn reset() {
+        IDS.with(|n| n.set(0));
+        BODIES.with(|n| n.set(0));
+        NODES.with(|n| n.set(0));
+    }
+    pub(crate) fn tick_id() {
+        IDS.with(|n| n.set(n.get() + 1));
+    }
+    pub(crate) fn tick_body() {
+        BODIES.with(|n| n.set(n.get() + 1));
+    }
+    pub(crate) fn tick_node() {
+        NODES.with(|n| n.set(n.get() + 1));
+    }
+}
+
 pub const PARAMS_LEN: usize = 32;
 /// Largest body: one 256 KiB media piece plus sealing overhead.
 pub const MAX_BODY: usize = 256 * 1024 + 64;
-pub const MAX_STATE: usize = 1 + MAX_BODY;
+/// The largest state of ANY kind: the outer guard, before the kind is known.
+pub const MAX_STATE: usize = 1 + pack::MAX_PACK;
+
+/// The body limit for one kind.
+///
+/// Per-kind rather than one cap, because a pack legitimately carries several
+/// blocks and is allowed a megabyte, while raising the global limit would let a
+/// megabyte RAW block through as a side effect — and `MAX_BODY` is what bounds
+/// a single block's cost to every host that stores it.
+pub fn max_body(kind: u8) -> usize {
+    match kind {
+        kind::PACK => pack::MAX_PACK,
+        _ => MAX_BODY,
+    }
+}
 
 /// Block kinds. Well-formedness per kind is added as each format lands.
 ///
@@ -27,6 +87,10 @@ pub mod kind {
     pub const FRAGMENT: u8 = 3;
     pub const PARITY: u8 = 4;
     pub const SCHEMA: u8 = 5;
+    /// A commit's blocks in one PUT. **Not 2** — that is `MEDIA_CHUNK`, and a
+    /// kind byte is hashed into every block id, so the bytes already taken are
+    /// taken for good.
+    pub const PACK: u8 = 6;
 }
 
 /// The state bytes for a block of `kind` holding `body`.
@@ -60,8 +124,17 @@ fn well_formed(kind: u8, body: &[u8]) -> bool {
     match kind {
         // One bounded pass over at most 16 KiB, no allocation beyond a key per
         // entry, and it never panics — safe to run on bytes a stranger sent.
-        kind::TREE_NODE => freenet_prolly::node::Node::parse(body)
-            .is_ok_and(|node| freenet_prolly::boundary::check_node(&node).is_ok()),
+        kind::TREE_NODE => {
+            #[cfg(any(test, feature = "testing"))]
+            work::tick_node();
+            freenet_prolly::node::Node::parse(body)
+                .is_ok_and(|node| freenet_prolly::boundary::check_node(&node).is_ok())
+        }
+        // Formats not landed yet: any body, as before.
+        // A pack is checked here and its MEMBERS are checked by this same
+        // function, one level down: a host that unpacks can never produce a
+        // block this contract would refuse.
+        kind::PACK => pack::well_formed(body),
         // Formats not landed yet: any body, as before.
         kind::RAW | kind::MEDIA_CHUNK | kind::FRAGMENT | kind::PARITY | kind::SCHEMA => true,
         _ => false,
@@ -72,9 +145,20 @@ fn well_formed(kind: u8, body: &[u8]) -> bool {
 pub fn check(params: &[u8], state: &[u8]) -> bool {
     params.len() == PARAMS_LEN
         && !state.is_empty()
-        && state.len() <= MAX_STATE
-        && well_formed(state[0], &state[1..])
+        // The size bound is per KIND, and it is checked before the body is
+        // looked at: an oversized state must cost a length comparison, not a
+        // parse of whatever it claims to be.
+        && state.len() <= 1 + max_body(state[0])
+        // THE HASH COMES BEFORE THE FORM, and the order is the whole cost
+        // argument. A block's key FIXES its bytes: exactly one string hashes to
+        // `params`. So one BLAKE3 pass over the state settles whether these
+        // bytes belong here at all, and `well_formed` — which for a full pack
+        // is a walk over 65,535 members — then only ever runs on the one string
+        // that does. The other way round, a stranger offering a well-formed
+        // megabyte under a key it does not hash to buys the whole walk before
+        // the hash refuses it.
         && blake3::hash(state).as_bytes() == params
+        && well_formed(state[0], &state[1..])
 }
 
 pub struct Block;
@@ -149,13 +233,13 @@ mod tests {
     use freenet_prolly::build::TreeBuilder;
     use freenet_prolly::node::{Agg, Node, NodeBuilder, NodeError, Value, HEADER, MAX_INLINE};
 
-    fn params_of(state: &[u8]) -> Parameters<'static> {
+    pub(crate) fn params_of(state: &[u8]) -> Parameters<'static> {
         Parameters::from(blake3::hash(state).as_bytes().to_vec())
     }
-    fn validate(p: Parameters<'static>, s: Vec<u8>) -> ValidateResult {
+    pub(crate) fn validate(p: Parameters<'static>, s: Vec<u8>) -> ValidateResult {
         Block::validate_state(p, State::from(s), Default::default()).unwrap()
     }
-    fn update(p: Parameters<'static>, held: Vec<u8>, data: Vec<Vec<u8>>) -> Vec<u8> {
+    pub(crate) fn update(p: Parameters<'static>, held: Vec<u8>, data: Vec<Vec<u8>>) -> Vec<u8> {
         let data = data
             .into_iter()
             .map(|d| UpdateData::State(State::from(d)))
@@ -169,7 +253,7 @@ mod tests {
 
     /// A leaf the tree library itself produced: two entries sharing the prefix
     /// `k/`, so the suffixes `aaa` and `bbb` are what the search index is over.
-    fn leaf_node() -> Vec<u8> {
+    pub(crate) fn leaf_node() -> Vec<u8> {
         let mut b = NodeBuilder::leaf();
         b.push(b"k/aaa", Value::Inline(b"one")).unwrap();
         b.push(b"k/bbb", Value::Inline(b"two")).unwrap();
@@ -469,9 +553,10 @@ mod tests {
                 kind::MEDIA_CHUNK,
                 kind::FRAGMENT,
                 kind::PARITY,
-                kind::SCHEMA
+                kind::SCHEMA,
+                kind::PACK
             ],
-            [2, 3, 4, 5]
+            [2, 3, 4, 5, 6]
         );
     }
 
@@ -635,5 +720,406 @@ mod tests {
                 "adopted {a:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod pack_tests {
+    use super::tests::*;
+    use super::*;
+    use crate::pack::{build, MAX_PACK, MIN_MEMBER};
+    use crate::work;
+
+    fn raw(b: &[u8]) -> (u8, Vec<u8>) {
+        (kind::RAW, b.to_vec())
+    }
+    fn node() -> (u8, Vec<u8>) {
+        (kind::TREE_NODE, leaf_node())
+    }
+    fn state_of(members: &[(u8, Vec<u8>)]) -> Vec<u8> {
+        encode(kind::PACK, &build(members).expect("a buildable pack"))
+    }
+
+    /// Every door the contract has, so a rule cannot hold at one and not
+    /// another. `check` is the shared one, but the entry points reach it by
+    /// different routes and a pre-gate in front of any of them would be
+    /// invisible from the others.
+    fn accepted_at_every_door(state: &[u8]) -> bool {
+        let p = params_of(state);
+        let v = validate(p.clone(), state.to_vec()) == ValidateResult::Valid;
+        // An empty block adopts a valid candidate, and refuses an invalid one.
+        let adopted = update(p.clone(), Vec::new(), vec![state.to_vec()]) == state;
+        let summarised = Block::summarize_state(p.clone(), State::from(state.to_vec())).is_ok();
+        let delta = Block::get_state_delta(
+            p,
+            State::from(state.to_vec()),
+            StateSummary::from(Vec::new()),
+        )
+        .is_ok();
+        assert_eq!(v, adopted, "validate and update disagree about this state");
+        assert!(summarised && delta, "the read doors must not error");
+        v
+    }
+
+    #[test]
+    fn a_pack_of_valid_blocks_is_accepted_at_every_door() {
+        let s = state_of(&[raw(b"one"), raw(b"two"), node()]);
+        assert!(accepted_at_every_door(&s));
+        // One member is a pack too: `count = 1` is legitimate.
+        assert!(accepted_at_every_door(&state_of(&[raw(b"alone")])));
+    }
+
+    /// A member is valid exactly when the same bytes are valid as their own
+    /// Block. This is the promise that lets the parity rule change what a
+    /// `TREE_NODE` may be without a second format change here: packs call the
+    /// contract's own `well_formed`, they do not restate its rules.
+    #[test]
+    fn a_member_is_valid_exactly_when_it_is_valid_as_its_own_block() {
+        let mut broken = leaf_node();
+        let at = broken.len() / 2;
+        broken[at] ^= 0xff;
+        for (what, k, body) in [
+            ("a good node", kind::TREE_NODE, leaf_node()),
+            ("a corrupted node", kind::TREE_NODE, broken),
+            ("raw bytes", kind::RAW, b"anything".to_vec()),
+            ("an empty raw body", kind::RAW, Vec::new()),
+        ] {
+            let alone = encode(k, &body);
+            let as_block = accepted_at_every_door(&alone);
+            let in_pack = accepted_at_every_door(&state_of(&[(k, body)]));
+            assert_eq!(
+                as_block, in_pack,
+                "{what}: accepted as a block = {as_block}, in a pack = {in_pack}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_hostile_list_is_refused_at_every_door() {
+        let good = build(&[raw(b"one"), raw(b"two"), node()]).expect("a buildable pack");
+        assert!(
+            accepted_at_every_door(&encode(kind::PACK, &good)),
+            "control"
+        );
+
+        let truncated_member = {
+            let mut b = build(&[raw(b"abcdefgh")]).expect("a buildable pack");
+            b.pop();
+            b
+        };
+        let bad_magic = {
+            let mut b = good.clone();
+            b[0] = b'X';
+            b
+        };
+        let count_too_high = {
+            let mut b = good.clone();
+            b[4..6].copy_from_slice(&9u16.to_le_bytes());
+            b
+        };
+        let count_too_low = {
+            let mut b = good.clone();
+            b[4..6].copy_from_slice(&2u16.to_le_bytes());
+            b
+        };
+        let trailing = {
+            let mut b = good.clone();
+            b.push(0);
+            b
+        };
+        // Two members the wrong way round, and the same member twice.
+        let (a, c) = (raw(b"one"), raw(b"two"));
+        let ordered = if freenet_prolly::block_id(a.0, &a.1) < freenet_prolly::block_id(c.0, &c.1) {
+            (a.clone(), c.clone())
+        } else {
+            (c.clone(), a.clone())
+        };
+        let mut out_of_order = Vec::from(&pack::MAGIC[..]);
+        out_of_order.extend_from_slice(&2u16.to_le_bytes());
+        for (k, body) in [&ordered.1, &ordered.0] {
+            out_of_order.push(*k);
+            out_of_order.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            out_of_order.extend_from_slice(body);
+        }
+        // Built by hand: `build` folds a repeated member into one, so a
+        // fixture made through the builder can no longer express what the
+        // builder refuses to produce.
+        let duplicate = {
+            let mut b = Vec::from(&pack::MAGIC[..]);
+            b.extend_from_slice(&2u16.to_le_bytes());
+            for _ in 0..2 {
+                b.push(kind::RAW);
+                b.extend_from_slice(&4u32.to_le_bytes());
+                b.extend_from_slice(b"same");
+            }
+            b
+        };
+
+        for (what, body) in [
+            ("no magic", bad_magic),
+            ("count = 0", {
+                let mut b = good.clone();
+                b[4..6].copy_from_slice(&0u16.to_le_bytes());
+                b
+            }),
+            ("count higher than the members", count_too_high),
+            ("count lower than the members", count_too_low),
+            ("a truncated member", truncated_member),
+            ("trailing bytes", trailing),
+            ("members out of id order", out_of_order),
+            ("the same member twice", duplicate),
+            (
+                "a member of an unpackable kind",
+                build(&[(kind::MEDIA_CHUNK, b"x".to_vec())]).expect("a buildable pack"),
+            ),
+            (
+                "a pack inside a pack",
+                build(&[(kind::PACK, good.clone())]).expect("a buildable pack"),
+            ),
+            (
+                "a member of an unknown kind",
+                build(&[(200, b"x".to_vec())]).expect("a buildable pack"),
+            ),
+            ("a corrupted node member", {
+                let mut n = leaf_node();
+                let at = n.len() / 2;
+                n[at] ^= 0xff;
+                build(&[(kind::TREE_NODE, n)]).expect("a buildable pack")
+            }),
+            ("a member longer than its kind allows", {
+                let mut b = Vec::from(&pack::MAGIC[..]);
+                b.extend_from_slice(&1u16.to_le_bytes());
+                b.push(kind::RAW);
+                b.extend_from_slice(&((MAX_BODY + 1) as u32).to_le_bytes());
+                b.extend_from_slice(&vec![0u8; MAX_BODY + 1]);
+                b
+            }),
+            ("an empty body", Vec::new()),
+            ("a header and nothing else", Vec::from(&pack::MAGIC[..])),
+        ] {
+            let s = encode(kind::PACK, &body);
+            assert!(!accepted_at_every_door(&s), "{what} must be refused");
+        }
+        assert!(
+            accepted_at_every_door(&encode(kind::PACK, &good)),
+            "the control is still accepted"
+        );
+    }
+
+    /// A body over the pack ceiling is refused, and the ceiling is per KIND:
+    /// the same length as a RAW block is refused far sooner.
+    /// A pack is a SET, so the builder must fold a block offered twice into
+    /// one member — otherwise it hands its caller bytes the contract refuses.
+    #[test]
+    fn the_builder_folds_a_repeated_member_into_one() {
+        let once = state_of(&[raw(b"one"), raw(b"two")]);
+        let twice = state_of(&[raw(b"two"), raw(b"one"), raw(b"one"), raw(b"two")]);
+        assert_eq!(twice, once, "the same set must build the same bytes");
+        assert!(accepted_at_every_door(&twice));
+        // The control: a duplicate reaching the wire IS refused, so the
+        // assertion above is about the builder and not about duplicates being
+        // harmless.
+        let mut forged = Vec::from(&pack::MAGIC[..]);
+        forged.extend_from_slice(&2u16.to_le_bytes());
+        for _ in 0..2 {
+            forged.push(kind::RAW);
+            forged.extend_from_slice(&3u32.to_le_bytes());
+            forged.extend_from_slice(b"one");
+        }
+        assert!(!accepted_at_every_door(&encode(kind::PACK, &forged)));
+    }
+
+    #[test]
+    fn the_size_ceiling_is_per_kind() {
+        let at_cap = encode(kind::RAW, &vec![0u8; MAX_BODY]);
+        assert!(accepted_at_every_door(&at_cap));
+        assert!(!accepted_at_every_door(&encode(
+            kind::RAW,
+            &vec![0u8; MAX_BODY + 1]
+        )));
+        // A pack may be far larger than any single block.
+        let big = build(&[raw(&vec![7u8; MAX_BODY]), raw(&vec![9u8; MAX_BODY])])
+            .expect("two full-size members fit under MAX_PACK");
+        assert!(
+            big.len() > MAX_BODY,
+            "the fixture must exceed a block's cap"
+        );
+        assert!(accepted_at_every_door(&encode(kind::PACK, &big)));
+        // But not past its own.
+        let over = vec![0u8; MAX_PACK + 1];
+        assert!(!accepted_at_every_door(&encode(kind::PACK, &over)));
+    }
+
+    /// What REFUSING costs. A stranger can send a megabyte; it must not be able
+    /// to buy a megabyte of hashing with it. Counted, because no assertion
+    /// about the verdict can see this.
+    #[test]
+    fn a_hostile_pack_is_refused_before_any_member_is_hashed() {
+        // An honest pack of the same shape, for the control.
+        let honest = build(&[raw(b"one"), raw(b"two"), node()]).expect("a buildable pack");
+        work::reset();
+        assert!(check(
+            &blake3::hash(&encode(kind::PACK, &honest)).as_bytes()[..],
+            &encode(kind::PACK, &honest)
+        ));
+        assert_eq!(
+            (work::ids(), work::bodies()),
+            (3, 3),
+            "an honest pack pays per member"
+        );
+
+        // A megabyte of members whose FIRST kind byte is unpackable.
+        let mut hostile = Vec::from(&pack::MAGIC[..]);
+        let n = 20_000u16;
+        hostile.extend_from_slice(&n.to_le_bytes());
+        for _ in 0..n {
+            hostile.push(kind::MEDIA_CHUNK);
+            hostile.extend_from_slice(&0u32.to_le_bytes());
+        }
+        assert!(
+            hostile.len() >= n as usize * MIN_MEMBER,
+            "the fixture is the real shape"
+        );
+        work::reset();
+        assert!(!well_formed(kind::PACK, &hostile));
+        assert_eq!(
+            (work::ids(), work::bodies()),
+            (0, 0),
+            "an unpackable kind bought hashing"
+        );
+
+        // A count that cannot fit in what follows: refused from two lengths.
+        let mut absurd = Vec::from(&pack::MAGIC[..]);
+        absurd.extend_from_slice(&u16::MAX.to_le_bytes());
+        absurd.extend_from_slice(&[0u8; 32]);
+        work::reset();
+        assert!(!well_formed(kind::PACK, &absurd));
+        assert_eq!(
+            (work::ids(), work::bodies()),
+            (0, 0),
+            "an absurd count bought work"
+        );
+
+        // A member whose declared length is over its kind's cap: refused from
+        // the length FIELD, without reading the bytes it claims.
+        let mut oversize = Vec::from(&pack::MAGIC[..]);
+        oversize.extend_from_slice(&1u16.to_le_bytes());
+        oversize.push(kind::RAW);
+        oversize.extend_from_slice(&(u32::MAX).to_le_bytes());
+        oversize.extend_from_slice(&[0u8; 64]);
+        work::reset();
+        assert!(!well_formed(kind::PACK, &oversize));
+        assert_eq!(
+            (work::ids(), work::bodies()),
+            (0, 0),
+            "an oversize length bought work"
+        );
+
+        // And an out-of-order pack stops at the offending member rather than
+        // checking the rest: three members, the break at the second.
+        let mut ooo = Vec::from(&pack::MAGIC[..]);
+        let mut ms = [raw(b"one"), raw(b"two"), raw(b"three")];
+        ms.sort_by_key(|(k, b)| freenet_prolly::block_id(*k, b));
+        ms.swap(0, 1);
+        ooo.extend_from_slice(&3u16.to_le_bytes());
+        for (k, b) in &ms {
+            ooo.push(*k);
+            ooo.extend_from_slice(&(b.len() as u32).to_le_bytes());
+            ooo.extend_from_slice(b);
+        }
+        work::reset();
+        assert!(!well_formed(kind::PACK, &ooo));
+        assert_eq!(work::ids(), 2, "the order break must stop the walk");
+        assert_eq!(work::bodies(), 1, "and not check the members past it");
+    }
+}
+
+#[cfg(test)]
+mod pack_cost_tests {
+    use super::tests::*;
+    use super::*;
+    use crate::pack::{build, BuildError};
+
+    /// A block's KEY fixes its bytes, so anything offered under the wrong key
+    /// must cost one hash and nothing else.
+    ///
+    /// The other order — form before hash — lets a stranger buy the full walk
+    /// over a 65,535-member pack (about 15.6 ms) with bytes that were never
+    /// going to be accepted, as often as it likes. Counted, because the verdict
+    /// is "refused" either way and no assertion about it can see the
+    /// difference.
+    #[test]
+    fn a_state_under_the_wrong_key_costs_one_hash_and_no_walk() {
+        let members: Vec<(u8, Vec<u8>)> = (0..u16::MAX as u32)
+            .map(|i| (kind::RAW, (i as u16).to_le_bytes().to_vec()))
+            .collect();
+        let state = encode(kind::PACK, &build(&members).expect("a buildable pack"));
+        assert!(
+            state.len() > 400_000,
+            "the fixture must be the real worst case"
+        );
+
+        // The control: under its own key the pack IS accepted, and pays.
+        work::reset();
+        assert!(check(blake3::hash(&state).as_bytes(), &state));
+        assert_eq!(work::ids(), u16::MAX as usize);
+        assert_eq!(work::bodies(), u16::MAX as usize);
+
+        // Under a key it does not hash to: one BLAKE3 pass, no walk.
+        work::reset();
+        assert!(!check(&[0u8; PARAMS_LEN], &state));
+        assert_eq!(
+            (work::ids(), work::bodies()),
+            (0, 0),
+            "a pack under the wrong key bought the member walk"
+        );
+
+        // The same for a tree node, which is the other kind whose form costs
+        // real work: a parse and a boundary check.
+        let node = encode(kind::TREE_NODE, &leaf_node());
+        work::reset();
+        assert!(check(blake3::hash(&node).as_bytes(), &node));
+        assert_eq!(work::nodes(), 1, "the control must actually check the node");
+        work::reset();
+        assert!(!check(&[0u8; PARAMS_LEN], &node));
+        assert_eq!(work::nodes(), 0, "a node under the wrong key was parsed");
+    }
+
+    /// `build` is what the engine calls, so the ways it can fail belong to its
+    /// own signature rather than to a refusal three layers away.
+    #[test]
+    fn build_refuses_what_it_cannot_express() {
+        assert_eq!(build(&[]), Err(BuildError::Empty));
+        // Over MAX_PACK: five members at the body cap.
+        let big: Vec<(u8, Vec<u8>)> = (0..5u8)
+            .map(|i| {
+                let mut b = vec![0u8; MAX_BODY];
+                b[0] = i;
+                (kind::RAW, b)
+            })
+            .collect();
+        assert!(matches!(build(&big), Err(BuildError::TooLarge(_))));
+        // And the ordinary case still works.
+        assert!(build(&[(kind::RAW, b"x".to_vec())]).is_ok());
+    }
+
+    /// An empty RAW body is a legitimate block, so it is a legitimate member.
+    /// Pinned because "the smallest member" is what every early refusal is
+    /// measured against, and a rule that quietly excluded it would move that
+    /// floor without anything failing.
+    #[test]
+    fn an_empty_raw_member_is_allowed() {
+        let s = encode(
+            kind::PACK,
+            &build(&[(kind::RAW, Vec::new()), (kind::RAW, b"x".to_vec())])
+                .expect("a buildable pack"),
+        );
+        assert!(check(blake3::hash(&s).as_bytes(), &s));
+        // And alone.
+        let alone = encode(
+            kind::PACK,
+            &build(&[(kind::RAW, Vec::new())]).expect("buildable"),
+        );
+        assert!(check(blake3::hash(&alone).as_bytes(), &alone));
     }
 }

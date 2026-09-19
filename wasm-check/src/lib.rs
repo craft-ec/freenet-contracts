@@ -130,12 +130,19 @@ pub extern "C" fn well_formed_n(h: u32, runs: u32) -> u32 {
 pub struct Reg {
     params: Vec<u8>,
     state: Vec<u8>,
+    /// A record the held state already beats — the cheapest thing an attacker
+    /// can replay at a host, and the case verifying late exists for.
+    stale: Vec<u8>,
 }
 
 #[no_mangle]
 pub extern "C" fn prepare_register() -> u32 {
-    let (params, state) = craftec_register_contract::testing::worst_case();
-    Box::into_raw(Box::new(Reg { params, state })) as u32
+    let (params, state, stale) = craftec_register_contract::testing::worst_case();
+    Box::into_raw(Box::new(Reg {
+        params,
+        state,
+        stale,
+    })) as u32
 }
 
 /// # Safety
@@ -177,4 +184,37 @@ pub extern "C" fn register_accepts_good_refuses_corrupt(h: u32) -> u32 {
         craftec_register_contract::read(&r.params, &r.state).is_some()
             && craftec_register_contract::read(&r.params, &bad).is_none(),
     )
+}
+
+/// Replaying a record the state already beats, `runs` times, the way the
+/// contract does it now: parse, compare decisions, verify nothing.
+#[no_mangle]
+pub extern "C" fn register_stale_replay_n(h: u32, runs: u32) -> u32 {
+    let r = unsafe { reg(h) };
+    (0..runs)
+        .filter(|_| {
+            craftec_register_contract::cost::verify_late(
+                std::hint::black_box(&r.params),
+                std::hint::black_box(&r.state),
+                std::hint::black_box(&r.stale),
+            )
+            .is_some()
+        })
+        .count() as u32
+}
+
+/// The same replay with the pre-verify-late policy: verify everything first.
+#[no_mangle]
+pub extern "C" fn register_stale_replay_eager_n(h: u32, runs: u32) -> u32 {
+    let r = unsafe { reg(h) };
+    (0..runs)
+        .filter(|_| {
+            craftec_register_contract::cost::verify_eagerly(
+                std::hint::black_box(&r.params),
+                std::hint::black_box(&r.state),
+                std::hint::black_box(&r.stale),
+            )
+            .is_some()
+        })
+        .count() as u32
 }

@@ -25,36 +25,125 @@ pub mod testing;
 pub mod wire;
 
 use merge::update;
-use wire::{Params, RegState};
+use wire::{conflicts, Params, RegState};
 
 /// Largest state: a full value, a full 16-of-16 record, and evidence of the same
 /// size minus the values. Generous — the encodings are checked exactly.
 pub const MAX_STATE: usize = 64 * 1024;
 
-/// Parse and fully verify a state against its params.
+/// Parse and fully verify a state against its params. This is what
+/// `validate_state` does: a state offered to a host is checked in full.
 pub fn read(params: &[u8], state: &[u8]) -> Option<(Params, RegState)> {
+    let (p, s) = read_unverified(params, state)?;
+    s.verify(&p).then_some((p, s))
+}
+
+/// Structure only, for the state a host ALREADY HOLDS.
+///
+/// Its signatures were checked by `validate_state` before it was ever stored,
+/// and re-checking them on every update, summary and delta would cost `k`
+/// verifications each time for an answer that cannot have changed — the same
+/// waste that makes a replayed record expensive. Candidates arriving from the
+/// network are a different matter and are verified in `absorb`.
+pub fn read_unverified(params: &[u8], state: &[u8]) -> Option<(Params, RegState)> {
     if state.len() > MAX_STATE {
         return None;
     }
     let p = Params::parse(params)?;
-    let s = RegState::parse(state, &p)?;
+    let s = RegState::parse_unverified(state, &p)?;
     Some((p, s))
 }
 
-/// `terminal ‖ seq ‖ BLAKE3(record) ‖ BLAKE3(evidence)`, with the hash of the
-/// empty string standing for a part that is absent.
-fn summary_of(s: &RegState, p: &Params) -> Vec<u8> {
+/// `terminal ‖ seq ‖ BLAKE3(value) ‖ BLAKE3(the evidence's pair of decisions)`,
+/// with the hash of the empty string for a part that is absent.
+///
+/// Built from DECISIONS, never from encodings. Two replicas can legitimately
+/// hold different witnesses of one decision; if the summary read the witness
+/// they would see each other as out of date forever and re-send the state on
+/// every exchange, for a difference neither of them needs to resolve.
+pub(crate) fn summary_of(s: &RegState) -> Vec<u8> {
     let mut out = Vec::with_capacity(1 + 8 + 32 + 32);
-    let (terminal, seq) = s
-        .record
-        .as_ref()
-        .map_or((false, 0), |r| (r.signed.terminal, r.signed.seq));
-    out.push(u8::from(terminal));
-    out.extend_from_slice(&seq.to_le_bytes());
-    let part = |b: Option<Vec<u8>>| *blake3::hash(&b.unwrap_or_default()).as_bytes();
-    out.extend_from_slice(&part(s.record.as_ref().map(|r| r.encode(&p.authority))));
-    out.extend_from_slice(&part(s.evidence.as_ref().map(|e| e.encode(&p.authority))));
+    let d = s.record.as_ref().map(|r| r.decision());
+    out.push(u8::from(d.is_some_and(|d| d.terminal)));
+    out.extend_from_slice(&d.map_or(0, |d| d.seq).to_le_bytes());
+    out.extend_from_slice(&d.map_or([0u8; 32], |d| d.value_hash));
+    let pair = s.evidence.as_ref().map(|e| {
+        let (x, y) = e.decisions();
+        [x.encode(), y.encode()].concat()
+    });
+    out.extend_from_slice(blake3::hash(&pair.unwrap_or_default()).as_bytes());
     out
+}
+
+/// Merge a parsed-but-unverified candidate into `held`, verifying only the
+/// parts that could change anything.
+///
+/// Anyone can send anything, `k` can be 16, and the cheapest attack on a host
+/// is to replay records it already has. So the decision is compared first and
+/// signatures are checked only for a candidate that could win — a greater
+/// decision, one that conflicts with the held record (it becomes evidence), or
+/// a lower evidence pair. A stale record, or another witness of the decision
+/// already held, costs a parse.
+///
+/// Skipping those checks is safe precisely because they could not matter: a
+/// candidate that loses the decision order is discarded whether its signatures
+/// hold or not.
+fn absorb(held: &RegState, cand: RegState, p: &Params) -> RegState {
+    let mut out = held.clone();
+    if let Some(r) = cand.record {
+        let useful = match &held.record {
+            None => true,
+            Some(h) => {
+                merge::order(&r, h) == core::cmp::Ordering::Greater
+                    || conflicts(&r.signed, &h.signed)
+            }
+        };
+        if useful && r.verify(p) {
+            let c = RegState {
+                record: Some(r),
+                evidence: None,
+            };
+            out = update(&out, &c, &p.authority);
+        }
+    }
+    if let Some(e) = cand.evidence {
+        let useful = held.evidence.as_ref().is_none_or(|h| e.key() < h.key());
+        if useful && e.verify(p) {
+            out = update(
+                &out,
+                &RegState {
+                    record: None,
+                    evidence: Some(e),
+                },
+                &p.authority,
+            );
+        }
+    }
+    out
+}
+
+/// The two update paths, side by side, so the saving from verifying late can be
+/// MEASURED rather than asserted. Both mirror `update_state` for a single
+/// candidate; only the verification policy differs.
+#[cfg(any(test, feature = "testing"))]
+pub mod cost {
+    use super::*;
+
+    /// What the contract does now: parse, compare decisions, verify only a
+    /// candidate that could win.
+    pub fn verify_late(params: &[u8], held: &[u8], cand: &[u8]) -> Option<Vec<u8>> {
+        let (p, h) = read_unverified(params, held)?;
+        let c = RegState::parse_unverified(cand, &p)?;
+        Some(absorb(&h, c, &p).encode(&p.authority))
+    }
+
+    /// What it did before: verify the held state and every candidate in full,
+    /// then merge.
+    pub fn verify_eagerly(params: &[u8], held: &[u8], cand: &[u8]) -> Option<Vec<u8>> {
+        let (p, h) = read(params, held)?;
+        let c = RegState::parse(cand, &p)?;
+        Some(update(&h, &c, &p.authority).encode(&p.authority))
+    }
 }
 
 pub struct Register;
@@ -77,7 +166,7 @@ impl ContractInterface for Register {
         state: State<'static>,
         data: Vec<UpdateData<'static>>,
     ) -> Result<UpdateModification<'static>, ContractError> {
-        let Some((p, mut held)) = read(parameters.as_ref(), state.as_ref()) else {
+        let Some((p, mut held)) = read_unverified(parameters.as_ref(), state.as_ref()) else {
             // The held state is not ours to fix; refusing is the only honest
             // answer, and it cannot happen for a state this contract produced.
             return Err(ContractError::InvalidState);
@@ -94,8 +183,8 @@ impl ContractInterface for Register {
             for bytes in candidates.into_iter().flatten() {
                 // An unreadable candidate is ignored, never fatal: one bad
                 // sender must not stop a good one in the same batch.
-                if let Some(c) = RegState::parse(bytes, &p) {
-                    held = update(&held, &c, &p.authority);
+                if let Some(c) = RegState::parse_unverified(bytes, &p) {
+                    held = absorb(&held, c, &p);
                 }
             }
         }
@@ -108,10 +197,10 @@ impl ContractInterface for Register {
         parameters: Parameters<'static>,
         state: State<'static>,
     ) -> Result<StateSummary<'static>, ContractError> {
-        let Some((p, s)) = read(parameters.as_ref(), state.as_ref()) else {
+        let Some((_, s)) = read_unverified(parameters.as_ref(), state.as_ref()) else {
             return Err(ContractError::InvalidState);
         };
-        Ok(StateSummary::from(summary_of(&s, &p)))
+        Ok(StateSummary::from(summary_of(&s)))
     }
 
     fn get_state_delta(
@@ -119,12 +208,12 @@ impl ContractInterface for Register {
         state: State<'static>,
         summary: StateSummary<'static>,
     ) -> Result<StateDelta<'static>, ContractError> {
-        let Some((p, s)) = read(parameters.as_ref(), state.as_ref()) else {
+        let Some((p, s)) = read_unverified(parameters.as_ref(), state.as_ref()) else {
             return Err(ContractError::InvalidState);
         };
         // Registers are small and the merge is a join, so the whole state is the
         // delta: sending it twice costs bytes, never correctness.
-        if summary.as_ref() == summary_of(&s, &p) {
+        if summary.as_ref() == summary_of(&s) {
             return Ok(StateDelta::from(Vec::new()));
         }
         Ok(StateDelta::from(s.encode(&p.authority)))
@@ -580,6 +669,159 @@ mod tests {
         );
         assert_ne!(summary(&forked), summary(&s));
         assert_ne!(summary(&other), summary(&s));
+    }
+
+    /// A second witness of the decision already held must leave the state byte
+    /// for byte unchanged — for another signer subset AND for a fresh signature
+    /// by the same subset. Anything less and a key holder can make every host
+    /// rewrite its state and wake every subscriber, for free, forever.
+    #[test]
+    fn a_second_witness_of_the_held_decision_is_a_no_op() {
+        let w = world();
+        let held = w.encode(&w.state(w.record(false, 4, b"the value")));
+        for (what, other) in [
+            (
+                "another signer subset",
+                w.alternate(false, 4, b"the value").expect("spare key"),
+            ),
+            (
+                "a fresh signature by the same subset",
+                w.resigned(false, 4, b"the value", 7),
+            ),
+        ] {
+            let bytes = w.encode(&w.state(other));
+            assert_ne!(bytes, held, "{what}: must really be a different encoding");
+            assert!(valid(&w.params_bytes, &bytes), "{what}: and a valid one");
+            assert_eq!(
+                update_with(&w.params_bytes, &held, vec![bytes]),
+                held,
+                "{what}: the state changed"
+            );
+        }
+    }
+
+    /// The same for evidence: a second proof of one fork does not rewrite the
+    /// state either.
+    #[test]
+    fn a_second_witness_of_the_held_evidence_is_a_no_op() {
+        let w = world();
+        let (x, y) = (w.record(false, 5, b"one"), w.record(false, 5, b"two"));
+        let forked = update_with(
+            &w.params_bytes,
+            &w.encode(&w.state(x.clone())),
+            vec![w.encode(&w.state(y.clone()))],
+        );
+        assert!(read(&w.params_bytes, &forked).unwrap().1.forked());
+        for (what, a, b) in [
+            (
+                "another signer subset",
+                w.alternate(false, 5, b"one").expect("spare key"),
+                w.alternate(false, 5, b"two").expect("spare key"),
+            ),
+            (
+                "fresh signatures",
+                w.resigned(false, 5, b"one", 11),
+                w.resigned(false, 5, b"two", 12),
+            ),
+        ] {
+            let other = RegState {
+                record: None,
+                evidence: Some(w.evidence_of(&a, &b)),
+            };
+            let bytes = w.encode(&other);
+            assert!(valid(&w.params_bytes, &bytes), "{what}");
+            assert_eq!(
+                update_with(&w.params_bytes, &forked, vec![bytes]),
+                forked,
+                "{what}: the proof was swapped for an equivalent one"
+            );
+        }
+    }
+
+    /// Two replicas can hold different witnesses of one decision. They must
+    /// report the SAME summary — if the summary read the encoding they would see
+    /// each other as stale forever and re-send on every exchange.
+    #[test]
+    fn different_witnesses_of_one_decision_report_one_summary() {
+        let w = world();
+        let a = w.encode(&w.state(w.record(false, 6, b"v")));
+        let b = w.encode(&w.state(w.resigned(false, 6, b"v", 3)));
+        assert_ne!(a, b, "the two replicas really do hold different bytes");
+        assert!(valid(&w.params_bytes, &a) && valid(&w.params_bytes, &b));
+        assert_eq!(summary(&w, &a), summary(&w, &b), "summaries must agree");
+        // So neither asks the other for anything.
+        assert!(delta(&w, &a, summary(&w, &b)).is_empty());
+        assert!(delta(&w, &b, summary(&w, &a)).is_empty());
+    }
+
+    /// Verification is the expensive part and anyone can ask for it, so a
+    /// candidate that cannot change the state must not buy any. Counted, not
+    /// argued.
+    #[test]
+    fn only_a_candidate_that_could_win_costs_signature_checks() {
+        let w = keyset(3, 5, false);
+        let held = w.encode(&w.state(w.record(false, 5, b"held")));
+        let cost = |cand: Vec<u8>| {
+            wire::verifications::reset();
+            update_with(&w.params_bytes, &held, vec![cand]);
+            wire::verifications::count()
+        };
+        assert_eq!(
+            cost(w.encode(&w.state(w.record(false, 2, b"stale")))),
+            0,
+            "a replayed older record must cost a parse, not k verifications"
+        );
+        assert_eq!(
+            cost(w.encode(&w.state(w.resigned(false, 5, b"held", 9)))),
+            0,
+            "another witness of the held decision must cost nothing"
+        );
+        assert_eq!(
+            cost(w.encode(&w.state(w.record(false, 9, b"newer")))),
+            w.k,
+            "a greater decision costs exactly k"
+        );
+        // A full state offered for validation is still checked in full.
+        wire::verifications::reset();
+        assert!(valid(&w.params_bytes, &held));
+        assert_eq!(wire::verifications::count(), w.k);
+    }
+
+    /// A terminal record's value is the successor's contract instance id, so its
+    /// length is part of the format.
+    #[test]
+    fn a_terminal_value_must_be_exactly_32_bytes() {
+        let w = world();
+        let ok = w.record(true, 3, &[4u8; 32]);
+        control_is_accepted(&w, &ok);
+        for len in [0usize, 31, 33, 64] {
+            let bad = w.record(true, 3, &vec![4u8; len]);
+            assert!(
+                !valid(&w.params_bytes, &w.encode(&w.state(bad))),
+                "a {len}-byte terminal value must be refused"
+            );
+        }
+    }
+
+    fn summary(w: &World, s: &[u8]) -> Vec<u8> {
+        Register::summarize_state(
+            Parameters::from(w.params_bytes.clone()),
+            State::from(s.to_vec()),
+        )
+        .unwrap()
+        .as_ref()
+        .to_vec()
+    }
+
+    fn delta(w: &World, s: &[u8], sum: Vec<u8>) -> Vec<u8> {
+        Register::get_state_delta(
+            Parameters::from(w.params_bytes.clone()),
+            State::from(s.to_vec()),
+            StateSummary::from(sum),
+        )
+        .unwrap()
+        .as_ref()
+        .to_vec()
     }
 
     fn contains(hay: &[u8], needle: &[u8]) -> bool {

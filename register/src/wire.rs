@@ -12,6 +12,10 @@ pub const MAGIC: &[u8; 4] = b"RG01";
 /// can never be read as a signed message or the reverse.
 pub const SIG_DOMAIN: &[u8; 8] = b"RG01-sig";
 pub const MAX_LABEL: usize = 64;
+/// A terminal record's value is the successor register's contract instance id,
+/// and nothing else. Fixing the length lets a host reject a "moved-to" that
+/// points at something which cannot be a contract.
+pub const TERMINAL_VALUE_LEN: usize = 32;
 pub const MAX_VALUE: usize = 4096;
 pub const MAX_N: usize = 16;
 pub const KEY_LEN: usize = 32;
@@ -148,6 +152,41 @@ impl Params {
     }
 }
 
+/// What a record decides, with no trace of who witnessed it: the lattice is
+/// over these, and signatures are evidence that a decision was made, never part
+/// of its identity.
+///
+/// This matters for more than tidiness. An Ed25519 signature is not unique to
+/// its signer — whoever holds a key can mint unlimited distinct valid
+/// signatures of one message by choosing another nonce. Anything that ordered
+/// states by their encodings would therefore let one rogue member of a keyset
+/// produce an endless stream of strictly "better" states carrying the same
+/// decision, each one replacing the last on every host and waking every
+/// subscriber, with no equivocation and nothing attributable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Decision {
+    pub terminal: bool,
+    pub seq: u64,
+    pub value_hash: [u8; HASH_LEN],
+}
+
+impl Decision {
+    /// Strongest first: a terminal ends the register, then the higher `seq`,
+    /// then the LOWER value hash. Total over distinct decisions, and it never
+    /// consults a signature.
+    pub fn rank(&self) -> (bool, u64, core::cmp::Reverse<[u8; HASH_LEN]>) {
+        (self.terminal, self.seq, core::cmp::Reverse(self.value_hash))
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(1 + 8 + HASH_LEN);
+        out.push(u8::from(self.terminal));
+        out.extend_from_slice(&self.seq.to_le_bytes());
+        out.extend_from_slice(&self.value_hash);
+        out
+    }
+}
+
 /// The signed part of a record: what a signature covers, and exactly what
 /// evidence of equivocation needs. It carries the value's hash, never the value,
 /// so equivocation can be proved to someone who holds neither version.
@@ -163,6 +202,14 @@ pub struct Signed {
 }
 
 impl Signed {
+    pub fn decision(&self) -> Decision {
+        Decision {
+            terminal: self.terminal,
+            seq: self.seq,
+            value_hash: self.value_hash,
+        }
+    }
+
     fn encoded_len(a: &Authority) -> usize {
         SIGNED_FIELDS + a.bitmap_len() + a.sigs_required() * SIG_LEN
     }
@@ -255,10 +302,39 @@ impl Signed {
         }
         // Each signature is checked against its own signer, so a signature out of
         // key order fails, and one signer cannot fill two slots.
-        keys.iter()
-            .zip(&self.sigs)
-            .all(|(k, s)| k.verify_strict(&msg, &Signature::from_bytes(s)).is_ok())
+        keys.iter().zip(&self.sigs).all(|(k, s)| {
+            count_verification();
+            k.verify_strict(&msg, &Signature::from_bytes(s)).is_ok()
+        })
     }
+}
+
+/// Counts individual signature checks, so a test can assert that a candidate
+/// which cannot change the state costs a parse and no verification. Behind the
+/// `testing` feature, so the contract's wasm has neither the counter nor the
+/// branch.
+///
+/// Thread-local, not a global: the test runner runs tests in parallel, and a
+/// shared counter would report other tests' work as this one's — which reads as
+/// a real measurement and is not.
+#[cfg(any(test, feature = "testing"))]
+pub mod verifications {
+    use core::cell::Cell;
+    thread_local! {
+        pub(super) static COUNT: Cell<usize> = const { Cell::new(0) };
+    }
+    /// Signature checks on this thread since the last [`reset`].
+    pub fn count() -> usize {
+        COUNT.with(|c| c.get())
+    }
+    pub fn reset() {
+        COUNT.with(|c| c.set(0));
+    }
+}
+
+fn count_verification() {
+    #[cfg(any(test, feature = "testing"))]
+    verifications::COUNT.with(|c| c.set(c.get() + 1));
 }
 
 fn canonical_bool(b: u8) -> Option<bool> {
@@ -280,8 +356,17 @@ impl Record {
     pub fn new(signed: Signed, value: Vec<u8>) -> Option<Record> {
         // The hash in the signed part is what a signature commits to, so a record
         // whose value does not match it is not a record of that decision.
-        (value.len() <= MAX_VALUE && *blake3::hash(&value).as_bytes() == signed.value_hash)
+        let shape_ok = if signed.terminal {
+            value.len() == TERMINAL_VALUE_LEN
+        } else {
+            value.len() <= MAX_VALUE
+        };
+        (shape_ok && *blake3::hash(&value).as_bytes() == signed.value_hash)
             .then_some(Record { signed, value })
+    }
+
+    pub fn decision(&self) -> Decision {
+        self.signed.decision()
     }
 
     pub fn encode(&self, a: &Authority) -> Vec<u8> {
@@ -312,11 +397,17 @@ impl Record {
             return None;
         }
         let (value, rest) = rest.split_at_checked(vlen)?;
+        let terminal = canonical_bool(terminal)?;
+        // A terminal record's value IS the successor's contract instance id, so
+        // a host can refuse a "moved-to" that cannot point at a contract.
+        if terminal && vlen != TERMINAL_VALUE_LEN {
+            return None;
+        }
         let sig_len = a.bitmap_len() + a.sigs_required() * SIG_LEN;
         let (sig_block, _) = rest.split_at_checked(sig_len)?;
         let (bitmap, sigs) = Signed::parse_sigs(sig_block, a)?;
         let signed = Signed {
-            terminal: canonical_bool(terminal)?,
+            terminal,
             seq: u64::from_le_bytes(seq.try_into().ok()?),
             value_hash: *blake3::hash(value).as_bytes(),
             bitmap,
@@ -346,17 +437,44 @@ pub struct Evidence {
 }
 
 impl Evidence {
-    /// The pair, lower side first, if these two really do equivocate.
-    pub fn new(x: &Signed, y: &Signed, auth: &Authority) -> Option<Evidence> {
+    /// The pair, lower DECISION first, if these two really do equivocate. The
+    /// side order must not depend on the witnesses: two people proving one fork
+    /// with different signatures have to produce the same pair.
+    pub fn new(x: &Signed, y: &Signed, _auth: &Authority) -> Option<Evidence> {
         if !conflicts(x, y) {
             return None;
         }
-        let (a, b) = if x.encode(auth) <= y.encode(auth) {
+        let (a, b) = if x.decision().rank() <= y.decision().rank() {
             (x.clone(), y.clone())
         } else {
             (y.clone(), x.clone())
         };
         Some(Evidence { a, b })
+    }
+
+    /// What this proves, with the witnesses projected out: the unordered pair of
+    /// conflicting decisions.
+    pub fn decisions(&self) -> (Decision, Decision) {
+        (self.a.decision(), self.b.decision())
+    }
+
+    /// The total order used to keep ONE proof per register. Terminal pairs first
+    /// — a register that was ended twice is the worse fact — then the sequence
+    /// numbers NUMERICALLY (not by their little-endian bytes, under which seq
+    /// 256 would sort before seq 1), then the lower value hash, then the higher.
+    /// Built only from decisions, so which proof is kept cannot be steered by
+    /// re-signing one.
+    pub fn key(&self) -> (bool, u64, u64, [u8; HASH_LEN], [u8; HASH_LEN]) {
+        let (x, y) = self.decisions();
+        let terminal_pair = x.terminal && y.terminal;
+        (
+            // `false` sorts first, so a terminal pair must map to `false`.
+            !terminal_pair,
+            x.seq.min(y.seq),
+            x.seq.max(y.seq),
+            x.value_hash.min(y.value_hash),
+            x.value_hash.max(y.value_hash),
+        )
     }
 
     pub fn encode(&self, a: &Authority) -> Vec<u8> {
@@ -372,8 +490,8 @@ impl Evidence {
             a: Signed::parse(x, a)?,
             b: Signed::parse(y, a)?,
         };
-        // Canonical order, and it must actually be a conflict.
-        (e.a.encode(a) <= e.b.encode(a) && conflicts(&e.a, &e.b)).then_some(e)
+        // Canonical order by decision, and it must actually be a conflict.
+        (e.a.decision().rank() <= e.b.decision().rank() && conflicts(&e.a, &e.b)).then_some(e)
     }
 
     pub fn verify(&self, p: &Params) -> bool {
@@ -433,9 +551,28 @@ impl RegState {
         out
     }
 
-    /// Parse and verify in one step: a state is only ever handled if every
-    /// signature in it holds, so nothing downstream has to remember to check.
+    /// Parse and verify. `validate_state` uses this: a whole state offered to a
+    /// host is checked in full.
     pub fn parse(b: &[u8], p: &Params) -> Option<RegState> {
+        let s = Self::parse_unverified(b, p)?;
+        s.verify(p).then_some(s)
+    }
+
+    /// Every signature in the state holds.
+    pub fn verify(&self, p: &Params) -> bool {
+        self.record.as_ref().is_none_or(|r| r.verify(p))
+            && self.evidence.as_ref().is_none_or(|e| e.verify(p))
+    }
+
+    /// Structure only: magic, flags, canonical encodings, lengths, and that any
+    /// evidence really is a pair of conflicting decisions. Signatures are NOT
+    /// checked.
+    ///
+    /// `update_state` parses first and verifies only what could change the
+    /// state, so a replayed record or another witness of the decision already
+    /// held costs a parse instead of `k` signature checks. That is a real
+    /// difference: `k` can be 16, and anyone may send anything.
+    pub fn parse_unverified(b: &[u8], p: &Params) -> Option<RegState> {
         if b.is_empty() {
             return Some(RegState::default());
         }
@@ -450,9 +587,6 @@ impl RegState {
         let mut rest = rest;
         if flags & FLAG_RECORD != 0 {
             let (r, used) = Record::parse(rest, &p.authority)?;
-            if !r.verify(p) {
-                return None;
-            }
             state.record = Some(r);
             rest = &rest[used..];
         }
@@ -460,9 +594,6 @@ impl RegState {
             // Both sides are fixed-size, so this consumes exactly what is left
             // or fails — which is also what rejects trailing bytes.
             let e = Evidence::parse(rest, &p.authority)?;
-            if !e.verify(p) {
-                return None;
-            }
             state.evidence = Some(e);
         } else if !rest.is_empty() {
             return None;

@@ -53,6 +53,16 @@ const rtime = (() => {
   if (ok !== 200) throw new Error(`only ${ok}/200 validated`);
   return ns;
 })();
+const rep = (fn, runs) => {
+  fn(rh, 5);
+  const t = process.hrtime.bigint();
+  const ok = fn(rh, runs);
+  const ns = Number(process.hrtime.bigint() - t) / runs;
+  if (ok !== runs) throw new Error(`only ${ok}/${runs} succeeded`);
+  return ns;
+};
 console.log(`register, worst case (mode 1, n=16 k=16): ${rlen} B state`);
-console.log(`  validate_state       ${(rtime / 1000).toFixed(0)} us`);
+console.log(`  validate_state             ${(rtime / 1000).toFixed(0)} us`);
+console.log(`  stale replay, verify late  ${(rep(w.register_stale_replay_n, 200) / 1000).toFixed(0)} us`);
+console.log(`  stale replay, eager        ${(rep(w.register_stale_replay_eager_n, 200) / 1000).toFixed(0)} us`);
 JS

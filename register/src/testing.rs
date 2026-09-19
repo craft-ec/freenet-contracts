@@ -5,7 +5,9 @@
 //! the same one the tests assert on.
 
 use crate::merge::update;
-use crate::wire::{Authority, Evidence, Params, Record, RegState, Signed, MAGIC, SIG_LEN};
+use crate::wire::{
+    Authority, Decision, Evidence, Params, Record, RegState, Signed, MAGIC, SIG_LEN,
+};
 use ed25519_dalek::{Signer, SigningKey};
 
 /// Deterministic, so a failing case is the same case tomorrow.
@@ -166,12 +168,14 @@ impl World {
 
     /// States covering every shape the merge has to handle: empty, record only,
     /// evidence only (third-party proof), both, equivocating pairs, terminals.
+    /// Terminal values are 32 bytes, as the format requires, so every state here
+    /// is one the contract would actually accept.
     pub fn sample_states(&self) -> Vec<RegState> {
         let a = self.record(false, 7, b"one");
         let b = self.record(false, 7, b"two"); // same seq, other value: a fork
         let c = self.record(false, 9, b"later");
-        let t = self.record(true, 1, b"moved-to");
-        let t2 = self.record(true, 4, b"elsewhere"); // two terminals: also a fork
+        let t = self.record(true, 1, &[1u8; 32]);
+        let t2 = self.record(true, 4, &[2u8; 32]); // two terminals: also a fork
         let e1 = self.evidence_of(&a, &b);
         let e2 = self.evidence_of(&t, &t2);
         let mut out = vec![
@@ -235,7 +239,7 @@ impl World {
         // tie-break is exercised too.
         records.extend(self.alternate(false, 5, b"mid"));
         if with_terminal {
-            records.push(self.record(true, 2, b"moved-to"));
+            records.push(self.record(true, 2, &[3u8; 32]));
         }
         const REPLICAS: usize = 5;
         let mut reps = vec![RegState::default(); REPLICAS];
@@ -272,7 +276,7 @@ impl World {
 
 /// The worst case a host can be handed: mode 1 with `n = 16, k = 16`, so every
 /// validation verifies sixteen signatures, over a full-size value.
-pub fn worst_case() -> (Vec<u8>, Vec<u8>) {
+pub fn worst_case() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     let w = keyset(16, 16, false);
     let value = vec![0xa5u8; crate::wire::MAX_VALUE];
     let value_hash = *blake3::hash(&value).as_bytes();
@@ -294,5 +298,85 @@ pub fn worst_case() -> (Vec<u8>, Vec<u8>) {
         Some(crate::wire::MAX_VALUE),
         "the full-size value must be the one held"
     );
-    (w.params_bytes.clone(), w.encode(&full))
+    // And a record the state already beats, for measuring a replay.
+    let stale = w.encode(&w.state(w.record(false, 0, b"stale")));
+    (w.params_bytes.clone(), w.encode(&full), stale)
+}
+
+/// What a state DECIDES, with every witness projected out. The lattice laws hold
+/// on this, not on the bytes: two replicas that have synced agree here and may
+/// still hold different signatures.
+pub fn decisions(s: &RegState) -> (Option<Decision>, Option<(Decision, Decision)>) {
+    (
+        s.record.as_ref().map(|r| r.decision()),
+        s.evidence.as_ref().map(|e| e.decisions()),
+    )
+}
+
+/// Another valid signature of the SAME message by the same key, with a
+/// different nonce. Ed25519 signing is deterministic (RFC 8032), so a stock
+/// signer cannot produce one — but a key holder can, and that freedom is
+/// precisely what the decision lattice has to be immune to. Test-only: the
+/// dev-dependencies it needs never reach the contract's wasm.
+#[cfg(test)]
+fn resign(sk: &SigningKey, msg: &[u8], nonce: u64) -> [u8; SIG_LEN] {
+    use curve25519_dalek::{edwards::EdwardsPoint, scalar::Scalar};
+    use sha2::{Digest, Sha512};
+
+    let seed = sk.to_bytes();
+    let expanded: [u8; 64] = Sha512::digest(seed).into();
+    let mut scalar_bytes = [0u8; 32];
+    scalar_bytes.copy_from_slice(&expanded[..32]);
+    scalar_bytes[0] &= 248;
+    scalar_bytes[31] &= 127;
+    scalar_bytes[31] |= 64;
+    let secret = Scalar::from_bytes_mod_order(scalar_bytes);
+
+    // Any nonce yields a valid signature; RFC 8032 only *chooses* to derive it
+    // from the message so that signing is reproducible.
+    let mut nh = Sha512::new();
+    nh.update(b"resign");
+    nh.update(nonce.to_le_bytes());
+    nh.update(seed);
+    let r = Scalar::from_bytes_mod_order_wide(&nh.finalize().into());
+    let big_r = EdwardsPoint::mul_base(&r).compress();
+
+    let mut kh = Sha512::new();
+    kh.update(big_r.as_bytes());
+    kh.update(sk.verifying_key().to_bytes());
+    kh.update(msg);
+    let k = Scalar::from_bytes_mod_order_wide(&kh.finalize().into());
+
+    let mut out = [0u8; SIG_LEN];
+    out[..32].copy_from_slice(big_r.as_bytes());
+    out[32..].copy_from_slice(&(r + k * secret).to_bytes());
+    out
+}
+
+#[cfg(test)]
+impl World {
+    /// The held decision, witnessed again by the same quorum with a fresh nonce.
+    pub fn resigned(&self, terminal: bool, seq: u64, value: &[u8], nonce: u64) -> Record {
+        let value_hash = *blake3::hash(value).as_bytes();
+        let msg = self.params.signed_message(terminal, seq, &value_hash);
+        let mut bitmap = 0u16;
+        let mut sigs: Vec<[u8; SIG_LEN]> = Vec::new();
+        for i in 0..self.k {
+            bitmap |= 1 << i;
+            sigs.push(resign(&self.signers[i], &msg, nonce));
+        }
+        if matches!(self.auth, Authority::One(_)) {
+            bitmap = 0;
+        }
+        Record {
+            signed: Signed {
+                terminal,
+                seq,
+                value_hash,
+                bitmap,
+                sigs,
+            },
+            value: value.to_vec(),
+        }
+    }
 }

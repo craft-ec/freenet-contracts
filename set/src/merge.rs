@@ -135,6 +135,12 @@ pub fn join(a: &SetState, b: &SetState, p: &Params) -> SetState {
     deny.sort_by_key(|d| d.signer);
     deny.dedup_by(|x, y| x.signer == y.signer);
     deny.truncate(MAX_DENY as usize);
+    // `parse` refuses a denial of the owner's own key, so the join must not be
+    // able to produce one either — the same closure rule as the cap above. It
+    // cannot arrive through a state that parsed, but it can arrive through a
+    // delta or a candidate that was never parsed as a whole state, and a join
+    // that produced one would manufacture a state the contract refuses.
+    deny.retain(|d| d.signer != *p.owner.as_bytes());
 
     // One entry per slot, holding the best decision offered for it.
     let mut slots: Vec<Held> = Vec::with_capacity(a.held.len() + b.held.len());

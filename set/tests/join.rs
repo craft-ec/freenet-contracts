@@ -10,6 +10,7 @@ use craftec_set_contract::testing::{world, world_with};
 use craftec_set_contract::wire::{
     leading_zeros, Admission, Held, Item, Params, SetState, Tier, MAX_DENY, MAX_ITEM_KEY,
 };
+use craftec_set_contract::MAX_STATE;
 
 fn facts(s: &SetState) -> impl PartialEq + core::fmt::Debug {
     s.decisions()
@@ -292,6 +293,13 @@ fn the_one_pass_cut_selects_what_two_phases_would() {
             phase2.push(h);
         }
     }
+    // The join re-sorts its output, which is a no-op because `cut` already
+    // emits in rank order — pinned here so that redundancy is a recorded
+    // equivalence rather than a mutant that looks like a hole.
+    assert!(
+        one_pass.windows(2).all(|p| p[0].rank() < p[1].rank()),
+        "the cut must emit in rank order"
+    );
     let mut a: Vec<[u8; 32]> = one_pass.iter().map(|h| h.slot).collect();
     let mut b: Vec<[u8; 32]> = phase2.iter().map(|h| h.slot).collect();
     a.sort_unstable();
@@ -530,6 +538,10 @@ fn denials_union_and_survive_re_signing() {
 /// The laws over GENERATED states — because a hand-picked triple is how three
 /// people in a row missed a case on this contract.
 ///
+/// Every boundary below sits on OPPOSITE SIDES of a merge. One inside a single
+/// state is settled by the cut before any join sees it, and the sweep then
+/// passes with the rule it was meant to test removed.
+///
 /// The pool is drawn from the BOUNDARIES the parser enforces, not from
 /// comfortable middles: a payload at the cap and an empty one, a live-empty
 /// item beside a tombstone at the same `ts` (D2 lived exactly there), equal
@@ -542,9 +554,13 @@ fn denials_union_and_survive_re_signing() {
 /// not enforce on its output lets the contract manufacture a state it refuses,
 /// and under F23 that is a pair of replicas which never converge.
 #[test]
-fn the_laws_hold_over_every_triple_of_twelve_generated_states() {
+fn the_laws_hold_over_every_triple_of_the_generated_states() {
     let keys = MAX_DENY as usize + 20;
-    let w = world_with(11, keys, Admission::Cap, 2, 2, 0);
+    // quota = 1 with M = 2, DELIBERATELY: at quota == M the tier cut reaches
+    // every union the quota cut would have reached, so the quota check can be
+    // deleted without the sweep noticing. The two bounds have to be able to
+    // bite separately or only the tighter one is tested.
+    let w = world_with(11, keys, Admission::Cap, 2, 1, 0);
     let cap = w.params.payload_cap as usize;
     let pool: Vec<Item> = vec![
         w.item(0, b"a", 3, b"a3"),
@@ -572,14 +588,47 @@ fn the_laws_hold_over_every_triple_of_twelve_generated_states() {
             .collect()
     };
     // A windowed pool puts competing decisions in the SAME state, where the
-    // cut settles them before any join is asked — so the pair that must
+    // cut settles them before any join is asked — so every pair that must
     // disagree is given a state each, explicitly. Without this the sweep
-    // passes with `tombstone` removed from the decision order, which is D2.
+    // passes with `tombstone` removed from the decision order (D2), and the
+    // same is true of every boundary below: a boundary inside ONE state is
+    // settled before any join sees it.
     let mut states: Vec<SetState> = vec![
         SetState::default(),
+        // D2: a live-empty item and a tombstone at one ts.
         w.state(vec![w.item(1, b"b", 2, b"")]),
         w.state(vec![w.tombstone(1, b"b", 2)]),
+        // One signer's quota straddling a merge: `quota` slots each side, all
+        // different, so the union is over quota while the TIER still has room
+        // — which is the only shape in which the quota bound decides anything.
+        w.state(vec![w.item(1, b"p", 1, b"v")]),
+        w.state(vec![w.item(1, b"q", 1, b"v")]),
+        // A FULL cap tier each side, of different slots: the union is 2M.
+        w.state(vec![w.item(1, b"t", 1, b"v"), w.item(2, b"u", 1, b"v")]),
+        w.state(vec![w.item(3, b"x", 1, b"v"), w.item(4, b"y", 1, b"v")]),
+        // A newer decision for a slot that the OTHER side is about to evict:
+        // a decision must never rescue a slot the cut drops, and the dropped
+        // side's version must not leak into what is kept.
+        w.state(vec![w.item(
+            1,
+            b"p",
+            5_000,
+            b"newest version of a doomed slot",
+        )]),
+        // Timestamp extremes on opposite sides, and unsealed-max against
+        // sealed-zero, which is where "sealed leads" has to hold or not at all.
+        w.state(vec![w.item(
+            1,
+            b"z",
+            u64::MAX,
+            b"unsealed, latest possible",
+        )]),
+        w.state(vec![w.sealed(1, b"z", 0, b"sealed, earliest possible")]),
+        // Equal ts at the extreme, decided on payload hash alone.
+        w.state(vec![w.item(2, b"w", u64::MAX, b"one")]),
+        w.state(vec![w.item(2, b"w", u64::MAX, b"two")]),
     ];
+    let hand_built = states.len();
     for i in 0..9 {
         let items: Vec<Item> = (0..3).map(|k| pool[(i + k) % pool.len()].clone()).collect();
         let deny = match i % 4 {
@@ -590,7 +639,10 @@ fn the_laws_hold_over_every_triple_of_twelve_generated_states() {
         };
         states.push(w.state_with(items, deny));
     }
-    assert_eq!(states.len(), 12);
+    assert!(
+        states.len() > hand_built,
+        "the windowed states must be added too"
+    );
     assert_ne!(
         states[1].decisions(),
         states[2].decisions(),
@@ -605,6 +657,8 @@ fn the_laws_hold_over_every_triple_of_twelve_generated_states() {
 
     let mut nontrivial = 0;
     let mut overflowed = 0;
+    let mut straddled = 0;
+    let mut tier_full = 0;
     for a in &states {
         assert_eq!(
             join(a, a, &w.params).decisions(),
@@ -626,6 +680,23 @@ fn the_laws_hold_over_every_triple_of_twelve_generated_states() {
             if a.deny.len() + b.deny.len() > MAX_DENY as usize {
                 overflowed += 1;
             }
+            let per_signer = |s: &SetState, k: &[u8; 32]| {
+                s.held
+                    .iter()
+                    .filter(|h| h.item.signer.as_bytes() == k)
+                    .count()
+            };
+            for h in a.held.iter() {
+                let k = h.item.signer.as_bytes();
+                if per_signer(a, k) + per_signer(b, k) > w.params.quota as usize {
+                    straddled += 1;
+                    break;
+                }
+            }
+            let tier = |s: &SetState| s.held.iter().filter(|h| h.tier == Tier::CapHolder).count();
+            if tier(a) + tier(b) > w.params.m as usize {
+                tier_full += 1;
+            }
             for c in &states {
                 let l = join(&join(a, b, &w.params), c, &w.params);
                 let r = join(a, &join(b, c, &w.params), &w.params);
@@ -643,6 +714,16 @@ fn the_laws_hold_over_every_triple_of_twelve_generated_states() {
     assert!(
         overflowed > 0,
         "no pair in the sweep overflowed the deny cap: D1's boundary is untested"
+    );
+    // The boundaries are only tested if the merges that straddle them are
+    // actually decided by the cut, so that is asserted rather than assumed.
+    assert!(
+        straddled > 0,
+        "no pair's union exceeded a signer's quota: the straddle is untested"
+    );
+    assert!(
+        tier_full > 0,
+        "no pair's union filled a tier twice over: the straddle is untested"
     );
 }
 
@@ -739,5 +820,131 @@ fn equal_rank_means_equal_decision() {
                 "rank and decision disagree about equality"
             );
         }
+    }
+}
+
+/// The owner cannot deny itself.
+///
+/// The owner signs denials, so it can always produce a valid one naming its own
+/// key — nothing else in the format would stop it, and the result is a second
+/// way to empty a Set: hide the owner's whole tier. Refused at parse, where a
+/// fetched state is the only thing a host checks, and dropped by the join so
+/// the join cannot manufacture a state the parser refuses.
+#[test]
+fn a_denial_of_the_owners_own_key_is_refused() {
+    let w = world();
+    let good = SetState {
+        deny: vec![w.deny_of(1)],
+        held: Vec::new(),
+    };
+    assert!(
+        craftec_set_contract::read(&w.params_bytes, &good.encode()).is_some(),
+        "the control: denying someone else is fine"
+    );
+
+    let self_denial = SetState {
+        deny: vec![w.deny_of(0)],
+        held: Vec::new(),
+    };
+    assert!(
+        craftec_set_contract::read(&w.params_bytes, &self_denial.encode()).is_none(),
+        "a denial of the owner's own key must be refused at parse"
+    );
+
+    // And the join cannot produce one, even from a candidate that never parsed
+    // as a whole state — the same closure rule as the deny cap.
+    let held = w.state(vec![w.item(0, b"k", 1, b"owner's item")]);
+    let merged = join(&held, &self_denial, &w.params);
+    assert!(
+        merged.deny.is_empty(),
+        "the join kept a denial of the owner's own key"
+    );
+    assert!(
+        craftec_set_contract::read(&w.params_bytes, &merged.encode()).is_some(),
+        "the join produced a state the contract refuses"
+    );
+    assert_eq!(
+        merged.visible().count(),
+        1,
+        "the owner's item is still visible"
+    );
+}
+
+/// The BYTE bound is closed under join too.
+///
+/// `MAX_STATE` is derived from the format's own maxima, so "the join cannot
+/// exceed it" is an argument — and an argument about a bound is exactly what
+/// was wrong about the deny cap. Asserted instead, on the largest pair the
+/// format allows: both tiers full on both sides with different slots, every
+/// item at its maximum encoded size, and a full deny list each side.
+#[test]
+fn the_join_of_two_maximal_states_stays_within_max_state() {
+    let keys = MAX_DENY as usize * 2 + 8;
+    let m = 4;
+    let w = world_with(21, keys, Admission::Cap, m, m, 0);
+    let cap = w.params.payload_cap as usize;
+    let big = |who: usize, tag: u8, n: u8| {
+        let mut key = vec![tag; MAX_ITEM_KEY];
+        key[0] = n;
+        w.item(who, &key, u64::MAX, &vec![0xcd; cap])
+    };
+    // Each side: a full owner tier and a full cap-holder tier, all distinct.
+    let side = |tag: u8, who_base: usize| {
+        let mut items: Vec<Item> = (0..m as u8).map(|n| big(0, tag, n)).collect();
+        items.extend((0..m as u8).map(|n| big(who_base + n as usize, tag, n)));
+        items
+    };
+    let a = w.state_with(
+        side(b'a', 1),
+        (1..=MAX_DENY as usize).map(|i| w.deny_of(i)).collect(),
+    );
+    let b = w.state_with(
+        side(b'b', 1),
+        (MAX_DENY as usize + 1..=2 * MAX_DENY as usize)
+            .map(|i| w.deny_of(i))
+            .collect(),
+    );
+    for s in [&a, &b] {
+        assert_eq!(
+            s.held.len(),
+            2 * m as usize,
+            "each side must be full in both tiers"
+        );
+        assert!(
+            craftec_set_contract::read(&w.params_bytes, &s.encode()).is_some(),
+            "each side must parse on its own"
+        );
+    }
+    let j = join(&a, &b, &w.params);
+    assert!(
+        j.encode().len() <= MAX_STATE,
+        "the join encodes to {} B, over MAX_STATE of {MAX_STATE}",
+        j.encode().len()
+    );
+    assert!(
+        craftec_set_contract::read(&w.params_bytes, &j.encode()).is_some(),
+        "the join produced a state the contract refuses"
+    );
+}
+
+/// The empty state is the identity, byte for byte — the WITNESS included.
+///
+/// Stated on bytes rather than on decisions because this is the one law where
+/// "the same facts" is not enough: merging with nothing must not swap a
+/// signature, a stamp nonce or a grant for an equivalent one, or every host
+/// rewrites its state and wakes every subscriber the first time it merges with
+/// a peer that has nothing.
+#[test]
+fn the_empty_state_is_the_identity_byte_for_byte() {
+    let w = world();
+    let empty = SetState::default();
+    for s in [
+        w.state(vec![w.item(0, b"a", 1, b"v")]),
+        w.state(vec![w.item(1, b"b", 2, b"v"), w.tombstone(2, b"c", 3)]),
+        w.state_with(vec![w.item(1, b"d", 4, b"v")], vec![w.deny_of(2)]),
+        empty.clone(),
+    ] {
+        assert_eq!(join(&s, &empty, &w.params).encode(), s.encode());
+        assert_eq!(join(&empty, &s, &w.params).encode(), s.encode());
     }
 }

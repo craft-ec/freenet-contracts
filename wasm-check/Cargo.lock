@@ -180,6 +180,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "craftec-bag-contract"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "freenet-stdlib",
+]
+
+[[package]]
 name = "craftec-block-contract"
 version = "0.1.0"
 dependencies = [
@@ -1209,6 +1217,7 @@ dependencies = [
 name = "wasm-check"
 version = "0.0.0"
 dependencies = [
+ "craftec-bag-contract",
  "craftec-block-contract",
  "craftec-register-contract",
  "freenet-prolly",

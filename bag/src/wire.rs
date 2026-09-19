@@ -22,6 +22,12 @@ pub const NONCE_LEN: usize = 8;
 /// Bytes of a name a summary carries. 16, not 8: "you already have it" is an
 /// assertion a stranger can aim at, and at 8 bytes aiming it costs 2^64/M.
 pub const TRUNC: usize = 16;
+/// The most work a bag may demand. Not 255: a `u8` can never reach the 256 bits
+/// of a name, so "work_bits < 256" is a check that cannot fail — it looked like
+/// a ceiling and enforced nothing. Sixty-four leading zeros is already beyond
+/// anyone's reach, so a bag asking for more is one nobody can ever write to,
+/// and refusing it at parse beats hosting it empty forever.
+pub const MAX_WORK_BITS: u8 = 64;
 
 /// What a bag is, fixed in its contract key.
 ///
@@ -64,9 +70,11 @@ impl Params {
         };
         // The ceilings are part of the format, not of a caller's judgement: a
         // bag whose params exceed them is not a bag this code will host.
-        (p.m >= 1 && p.m <= MAX_M && p.payload_cap >= 1 && p.payload_cap <= MAX_PAYLOAD
-            // 256 leading zero bits is every bit of the name: unmineable.
-            && (p.work_bits as usize) < HASH_LEN * 8)
+        (p.m >= 1
+            && p.m <= MAX_M
+            && p.payload_cap >= 1
+            && p.payload_cap <= MAX_PAYLOAD
+            && p.work_bits <= MAX_WORK_BITS)
             .then_some(p)
     }
 
@@ -138,7 +146,7 @@ impl Pointer {
         out.extend_from_slice(&self.nonce);
     }
 
-    fn read<'a>(b: &'a [u8], cap: u16) -> Option<(Pointer, &'a [u8])> {
+    fn read(b: &[u8], cap: u16) -> Option<(Pointer, &[u8])> {
         let (len, rest) = b.split_at_checked(2)?;
         let len = u16::from_le_bytes([len[0], len[1]]);
         if len > cap {

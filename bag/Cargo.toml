@@ -24,6 +24,7 @@ blake3 = { version = "1", default-features = false }
 # signing is deterministic per RFC 8032, so a stock signer cannot demonstrate
 # the freedom a key holder actually has. Dev-dependencies never reach the wasm.
 [dev-dependencies]
+craftec-bag-contract = { path = ".", features = ["testing"] }
 curve25519-dalek = "4"
 sha2 = "0.10"
 

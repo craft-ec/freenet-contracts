@@ -184,6 +184,7 @@ name = "craftec-bag-contract"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "craftec-bag-contract",
  "curve25519-dalek",
  "freenet-stdlib",
  "sha2",

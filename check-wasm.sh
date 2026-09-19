@@ -99,5 +99,6 @@ for (const [m, pay] of [[256, 256], [1024, 256], [256, 48], [1024, 48]]) {
     `${String(w.bag_summary_len(h)).padStart(6)} B   ${v.toFixed(0).padStart(8)} us   ${d.toFixed(0).padStart(10)} us`
   );
 }
-console.log('  (a byte-identical replay is dropped by the host before any wasm — F24b — so it costs 0 here)');
+console.log('  (on the PEER-BROADCAST path a byte-identical replay is dropped before any wasm — F24b — so it costs 0 there;');
+console.log('   through the client API in local mode an identical payload was measured running FULL validation, so it costs a validate_state)');
 JS

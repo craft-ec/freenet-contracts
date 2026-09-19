@@ -174,8 +174,16 @@ pub struct Held {
     pub work: u32,
 }
 
+/// Names hashed. A pointer's name costs a BLAKE3 over its payload, and that is
+/// the work a hostile state can impose — counted so a test can assert on it
+/// rather than on a clock.
+#[cfg(test)]
+pub static HASHED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 impl Held {
     pub fn of(ptr: Pointer, ph: &[u8; HASH_LEN]) -> Held {
+        #[cfg(test)]
+        HASHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let name = ptr.name(ph);
         Held {
             work: Pointer::work(&name),

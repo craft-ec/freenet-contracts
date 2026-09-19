@@ -57,6 +57,21 @@
 //! ceiling, and it is why the ceiling is frozen in the format rather than left
 //! to a caller.
 //!
+//! # What a replay costs
+//!
+//! A delta whose merge changes nothing still runs `update_state` and then a
+//! full `validate_state` (F24c) — measured at 1.5 ms for M = 1,024 pointers at
+//! the payload cap, 0.9 ms at a realistic 48-byte payload. Every host that
+//! processes the message pays it, so k distinct already-known pointers are k
+//! full validations.
+//!
+//! A byte-identical replay is cheaper, but only on ONE path: the
+//! peer-broadcast path drops it before any wasm runs (F24b). Through the client
+//! API in local mode an identical payload has been measured running full
+//! validation. So "identical bytes are free" is true of gossip between peers
+//! and NOT of a client resubmitting — worth knowing before building a retry on
+//! the assumption.
+//!
 //! # Validation stands alone
 //!
 //! A node that stores a bag fetched from a peer runs `validate_state` and
@@ -75,6 +90,12 @@ use merge::{delta, join, summarize};
 use wire::{BagState, Params, MAX_M, MAX_PAYLOAD};
 
 /// Largest state: M pointers at the payload cap, plus the header.
+///
+/// A cost-to-refuse guard, and it earns its place: without it a state claiming
+/// a plausible count and carrying megabytes behind it is parsed — every name
+/// hashed — before the trailing bytes are noticed at the very end. With it the
+/// length decides first and nothing is hashed at all. Measured in
+/// `tests::an_oversized_state_is_refused_before_any_name_is_hashed`.
 pub const MAX_STATE: usize =
     4 + 2 + (MAX_M as usize) * (2 + MAX_PAYLOAD as usize + wire::NONCE_LEN);
 
@@ -161,5 +182,111 @@ impl ContractInterface for Bag {
         // stop a sync.
         let d = delta(&s, summary.as_ref()).unwrap_or_else(|| s.clone());
         Ok(StateDelta::from(d.encode()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::merge::{collect, delta, join, summarize};
+    use crate::testing::{many, params};
+    use crate::wire::{BagState, Held, HASHED};
+    use std::sync::atomic::Ordering;
+
+    /// The length check refuses a huge state before a single name is hashed.
+    ///
+    /// Without it the parser reads `count` pointers — hashing each — and only
+    /// then notices the megabytes trailing behind them. The check looks
+    /// redundant because `parse` refuses the same input; what it changes is the
+    /// PRICE of refusing, which no correctness test can see.
+    #[test]
+    fn an_oversized_state_is_refused_before_any_name_is_hashed() {
+        let p = params(0, 64);
+        let s = collect(many(&p, 64, 5), &p);
+        let good = s.encode();
+        let ps = p.encode();
+
+        HASHED.store(0, Ordering::Relaxed);
+        assert!(read(&ps, &good).is_some());
+        let honest = HASHED.load(Ordering::Relaxed);
+        assert_eq!(honest, 64, "an honest read hashes one name per pointer");
+
+        // A valid bag with megabytes stapled to the end.
+        let mut hostile = good.clone();
+        hostile.extend(std::iter::repeat_n(0u8, MAX_STATE + 1_000_000));
+        assert!(hostile.len() > MAX_STATE);
+
+        HASHED.store(0, Ordering::Relaxed);
+        assert!(
+            read(&ps, &hostile).is_none(),
+            "trailing bytes must be refused"
+        );
+        assert_eq!(
+            HASHED.load(Ordering::Relaxed),
+            0,
+            "{} B of padding cost {} names hashed; the length check should have \
+             decided first",
+            hostile.len(),
+            HASHED.load(Ordering::Relaxed)
+        );
+
+        // And the control: with the length check bypassed, the same input costs
+        // a full parse. This is what the guard is worth.
+        HASHED.store(0, Ordering::Relaxed);
+        let p2 = Params::parse(&ps).expect("params");
+        assert!(BagState::parse(&hostile, &p2).is_none());
+        assert_eq!(
+            HASHED.load(Ordering::Relaxed),
+            honest,
+            "without the length check the parser hashes every name before \
+             noticing the padding"
+        );
+    }
+
+    /// A peer that is NOT full gets everything it lacks — the sender does not
+    /// try to work out which of them will survive the peer's own merge.
+    ///
+    /// Its own test: this rule was being killed only incidentally, by a test
+    /// about 8-byte collisions, which is not evidence about the rule.
+    #[test]
+    fn a_peer_with_room_is_sent_everything_it_lacks() {
+        let p = params(0, 32);
+        let pool = many(&p, 40, 17);
+        let mine = collect(pool.clone(), &p);
+        assert_eq!(mine.held.len(), 32, "the sender is full");
+
+        for have in [0usize, 1, 5, 20, 31] {
+            let theirs = BagState {
+                held: mine.held[..have].to_vec(),
+            };
+            assert!((theirs.held.len() as u16) < p.m, "the peer must have room");
+            let d = delta(&mine, &summarize(&theirs, p.m)).expect("a summary");
+
+            // Everything the sender holds and the peer lacks — no filtering by
+            // rank, because a peer with room can use any of it.
+            let want: Vec<[u8; 32]> = mine
+                .held
+                .iter()
+                .filter(|h| !theirs.held.iter().any(|x| x.name == h.name))
+                .map(|h| h.name)
+                .collect();
+            let got: Vec<[u8; 32]> = d.held.iter().map(|h| h.name).collect();
+            assert_eq!(got, want, "peer holding {have} of {}", p.m);
+            assert_eq!(d.held.len(), 32 - have);
+
+            // One round is enough.
+            assert_eq!(join(&theirs, &d, p.m), mine);
+        }
+
+        // The lowest-ranked pointer is sent too, even though a FULL peer would
+        // have refused it — that is the whole difference the flag makes.
+        let empty = BagState::default();
+        let d = delta(&mine, &summarize(&empty, p.m)).expect("a summary");
+        let lowest = mine.held.last().expect("full");
+        assert!(
+            d.held.iter().any(|h| h.name == lowest.name),
+            "a peer with room was not sent the cheapest pointer"
+        );
+        let _ = Held::of(pool[0].clone(), &p.hash());
     }
 }

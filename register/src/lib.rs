@@ -25,7 +25,7 @@ pub mod testing;
 pub mod wire;
 
 use merge::update;
-use wire::{conflicts, Params, RegState};
+use wire::{Evidence, Params, RegState};
 
 /// Largest state: a full value, a full 16-of-16 record, and evidence of the same
 /// size minus the values. Generous — the encodings are checked exactly.
@@ -94,8 +94,23 @@ fn absorb(held: &RegState, cand: RegState, p: &Params) -> RegState {
         let useful = match &held.record {
             None => true,
             Some(h) => {
-                merge::order(&r, h) == core::cmp::Ordering::Greater
-                    || conflicts(&r.signed, &h.signed)
+                if merge::order(&r, h) == core::cmp::Ordering::Greater {
+                    true
+                } else {
+                    // It cannot win the record slot, so it can only matter as
+                    // evidence — and only if that evidence beats what is held.
+                    // The pair's key comes from the two DECISIONS, so this is
+                    // decided before any signature is checked: replaying the
+                    // losing record of a fork already proved costs nothing,
+                    // however often it arrives.
+                    match Evidence::new(&r.signed, &h.signed, &p.authority) {
+                        None => false,
+                        Some(e) => held
+                            .evidence
+                            .as_ref()
+                            .is_none_or(|held_e| e.key() < held_e.key()),
+                    }
+                }
             }
         };
         if useful && r.verify(p) {
@@ -785,6 +800,99 @@ mod tests {
         wire::verifications::reset();
         assert!(valid(&w.params_bytes, &held));
         assert_eq!(wire::verifications::count(), w.k);
+    }
+
+    /// The most dangerous line in the contract, exercised through the entry
+    /// point an attacker actually reaches.
+    ///
+    /// `update_state` accepts evidence from anyone — that is deliberate, since a
+    /// fork must be provable by a third party. If it ever stopped checking the
+    /// signatures on that evidence, anyone could mark any register forked by
+    /// sending two made-up decisions, the global head included, and readers are
+    /// told not to follow a forked register. Nothing about that failure is
+    /// visible from `validate_state`, so every case here goes through
+    /// `update_state`.
+    #[test]
+    fn unsigned_or_foreign_evidence_cannot_fork_a_register_through_update() {
+        let w = world();
+        let held = w.encode(&w.state(w.record(false, 5, b"held")));
+        let (x, y) = (w.record(false, 5, b"one"), w.record(false, 5, b"two"));
+        let genuine = w.evidence_of(&x, &y);
+
+        let garbage = {
+            let mut e = genuine.clone();
+            e.a.sigs = vec![[0u8; 64]; w.k];
+            e.b.sigs = vec![[1u8; 64]; w.k];
+            e
+        };
+        let half = {
+            let mut e = genuine.clone();
+            e.b.sigs = vec![[2u8; 64]; w.k]; // one side still verifies
+            e
+        };
+        // Real signatures, real fork — but for a DIFFERENT register. Same keyset
+        // shape, so it parses here; the signatures are bound to other params.
+        let other = keyset_seeded(2, 2, 4, false);
+        let foreign = other.evidence_of(
+            &other.record(false, 5, b"one"),
+            &other.record(false, 5, b"two"),
+        );
+
+        for (what, e) in [
+            ("both sides unsigned", garbage),
+            ("one side unsigned", half),
+            ("signed for another register", foreign),
+        ] {
+            let bytes = w.encode(&RegState {
+                record: None,
+                evidence: Some(e),
+            });
+            let after = update_with(&w.params_bytes, &held, vec![bytes]);
+            assert_eq!(after, held, "{what}: the state changed");
+            assert!(
+                !read(&w.params_bytes, &after).unwrap().1.forked(),
+                "{what}: forged evidence marked the register forked"
+            );
+        }
+
+        // Control: genuine evidence for THIS register does fork it, so the three
+        // refusals above are not just "evidence never works".
+        let bytes = w.encode(&RegState {
+            record: None,
+            evidence: Some(genuine),
+        });
+        let after = update_with(&w.params_bytes, &held, vec![bytes]);
+        assert_ne!(after, held);
+        assert!(read(&w.params_bytes, &after).unwrap().1.forked());
+    }
+
+    /// Once a fork is proved, replaying its losing record must be free. It
+    /// conflicts with the held record, so a naive "does it conflict?" test would
+    /// verify it every time — and the losing record is exactly what an attacker
+    /// has a copy of.
+    #[test]
+    fn replaying_the_losing_record_of_a_known_fork_costs_nothing() {
+        let w = keyset(3, 5, false);
+        let (x, y) = (w.record(false, 5, b"one"), w.record(false, 5, b"two"));
+        let forked = update_with(
+            &w.params_bytes,
+            &w.encode(&w.state(x.clone())),
+            vec![w.encode(&w.state(y.clone()))],
+        );
+        let parsed = read(&w.params_bytes, &forked).unwrap().1;
+        assert!(parsed.forked());
+        // Whichever of the two lost the record slot is the one to replay.
+        let winner = parsed.record.as_ref().unwrap().value.clone();
+        let loser = if winner == x.value { y } else { x };
+
+        wire::verifications::reset();
+        let after = update_with(&w.params_bytes, &forked, vec![w.encode(&w.state(loser))]);
+        assert_eq!(
+            wire::verifications::count(),
+            0,
+            "replaying the losing record bought signature checks"
+        );
+        assert_eq!(after, forked, "and it must change nothing");
     }
 
     /// A terminal record's value is the successor's contract instance id, so its

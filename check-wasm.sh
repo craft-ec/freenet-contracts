@@ -66,3 +66,39 @@ console.log(`  validate_state             ${(rtime / 1000).toFixed(0)} us`);
 console.log(`  stale replay, verify late  ${(rep(w.register_stale_replay_n, 200) / 1000).toFixed(0)} us`);
 console.log(`  stale replay, eager        ${(rep(w.register_stale_replay_eager_n, 200) / 1000).toFixed(0)} us`);
 JS
+node - <<'JS'
+const fs = require('fs');
+const path = 'wasm-check/target/wasm32-unknown-unknown/release/wasm_check.wasm';
+const mod = new WebAssembly.Module(fs.readFileSync(path));
+const imports = {};
+for (const { module, name } of WebAssembly.Module.imports(mod)) {
+  (imports[module] ??= {})[name] = () => { throw new Error(`host import ${module}.${name}`); };
+}
+const { exports: w } = new WebAssembly.Instance(mod, imports);
+const time = (fn, h, runs) => {
+  fn(h, Math.min(runs, 20));
+  const t = process.hrtime.bigint();
+  const ok = fn(h, runs);
+  const ns = Number(process.hrtime.bigint() - t) / runs;
+  if (ok !== runs) throw new Error(`only ${ok}/${runs} passed`);
+  return ns / 1000;
+};
+console.log('');
+console.log('bag, worst case (M pointers at the 256 B payload cap), wasm32:');
+console.log('  M     payload    state      summary   validate_state   one no-op delta (update + F23 validate)');
+for (const [m, pay] of [[256, 256], [1024, 256], [256, 48], [1024, 48]]) {
+  const h = w.bag_prepare_with(m, pay);
+  if (w.bag_count(h) !== m) throw new Error(`bag_prepare(${m}) built ${w.bag_count(h)}`);
+  if (w.bag_accepts_good_refuses_corrupt(h) !== 1)
+    throw new Error('wasm32: validation does not separate a good bag from a corrupt one');
+  const runs = m === 256 ? 400 : 100;
+  const v = time(w.bag_validate_n, h, runs);
+  const d = time(w.bag_noop_delta_n, h, runs);
+  console.log(
+    `  ${String(m).padEnd(5)} ${String(pay).padStart(5)} B  ${String(w.bag_state_len(h)).padStart(8)} B  ` +
+    `${String(w.bag_summary_len(h)).padStart(6)} B   ${v.toFixed(0).padStart(8)} us   ${d.toFixed(0).padStart(10)} us`
+  );
+}
+console.log('  (on the PEER-BROADCAST path a byte-identical replay is dropped before any wasm — F24b — so it costs 0 there;');
+console.log('   through the client API in local mode an identical payload was measured running FULL validation, so it costs a validate_state)');
+JS

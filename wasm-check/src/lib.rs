@@ -218,3 +218,152 @@ pub extern "C" fn register_stale_replay_eager_n(h: u32, runs: u32) -> u32 {
         })
         .count() as u32
 }
+
+// ---------------------------------------------------------------------------
+// Bag: what a host pays per admitted update, and per replayed no-op delta.
+// ---------------------------------------------------------------------------
+
+/// A full bag at the worst size a host can be handed: M pointers, each with a
+/// payload at the cap, so every per-pointer hash runs as many times as it can.
+pub struct BagCase {
+    params: Vec<u8>,
+    state: Vec<u8>,
+    /// A delta carrying ONE pointer that is below the bag's cut: the merge
+    /// changes nothing, and the host still pays update + a full validate (F24).
+    noop: Vec<u8>,
+    count: u32,
+}
+
+#[no_mangle]
+pub extern "C" fn bag_prepare(m: u32) -> u32 {
+    bag_prepare_with(m, 256)
+}
+
+/// The same, at a chosen payload size: the worst case is dominated by the cap,
+/// and a real pointer is a reference of about fifty bytes.
+#[no_mangle]
+pub extern "C" fn bag_prepare_with(m: u32, payload: u32) -> u32 {
+    use craftec_bag_contract::merge::{collect, join};
+    use craftec_bag_contract::testing::{many, params};
+    use craftec_bag_contract::wire::BagState;
+    // work_bits 0: mining is not what is being timed, and validation hashes
+    // every name whatever the price was.
+    let mut p = params(0, m as u16);
+    p.payload_cap = 256;
+    let ptrs: Vec<_> = many(&p, m as usize + 1, 1)
+        .into_iter()
+        .map(|mut x| {
+            x.payload = vec![0xab; payload as usize];
+            x
+        })
+        .collect();
+    // Distinct payloads, so the names differ.
+    let ptrs: Vec<_> = ptrs
+        .into_iter()
+        .enumerate()
+        .map(|(i, mut x)| {
+            x.payload[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            x
+        })
+        .collect();
+    let full = collect(ptrs.clone(), &p);
+    // The one left over is below the cut once the bag is full.
+    let extra = collect(ptrs.clone(), &p);
+    let lowest = full.held.last().expect("full").rank();
+    let below: Vec<_> = extra
+        .held
+        .iter()
+        .filter(|h| h.rank() > lowest)
+        .take(1)
+        .cloned()
+        .collect();
+    let noop = BagState {
+        held: if below.is_empty() {
+            // Every mined name made the cut; take the lowest instead — merging
+            // it changes nothing either, which is what is being timed.
+            vec![full.held.last().expect("full").clone()]
+        } else {
+            below
+        },
+    };
+    // Sanity: merging the no-op really does change nothing.
+    let merged = join(&full, &noop, p.m);
+    assert!(merged == full, "the no-op delta is not a no-op");
+    let case = BagCase {
+        params: p.encode(),
+        state: full.encode(),
+        noop: noop.encode(),
+        count: full.held.len() as u32,
+    };
+    Box::into_raw(Box::new(case)) as u32
+}
+
+fn bag_case(h: u32) -> &'static BagCase {
+    unsafe { &*(h as *const BagCase) }
+}
+
+#[no_mangle]
+pub extern "C" fn bag_count(h: u32) -> u32 {
+    bag_case(h).count
+}
+
+#[no_mangle]
+pub extern "C" fn bag_state_len(h: u32) -> u32 {
+    bag_case(h).state.len() as u32
+}
+
+#[no_mangle]
+pub extern "C" fn bag_summary_len(h: u32) -> u32 {
+    use craftec_bag_contract::merge::summarize;
+    let c = bag_case(h);
+    let (p, s) = craftec_bag_contract::read(&c.params, &c.state).expect("prepared");
+    summarize(&s, p.m).len() as u32
+}
+
+/// `validate_state` over the whole bag: what F23 charges per admitted update,
+/// on every hosting node.
+#[no_mangle]
+pub extern "C" fn bag_validate_n(h: u32, runs: u32) -> u32 {
+    let c = bag_case(h);
+    let mut ok = 0;
+    for _ in 0..runs {
+        if craftec_bag_contract::read(&c.params, &c.state).is_some() {
+            ok += 1;
+        }
+    }
+    ok
+}
+
+/// ONE no-op delta, the whole cost a host pays for it: parse the held state,
+/// merge the delta, re-encode — and then the full `validate_state` F23 runs
+/// over the result before anything is persisted.
+#[no_mangle]
+pub extern "C" fn bag_noop_delta_n(h: u32, runs: u32) -> u32 {
+    use craftec_bag_contract::merge::join;
+    use craftec_bag_contract::wire::BagState;
+    let c = bag_case(h);
+    let mut ok = 0;
+    for _ in 0..runs {
+        let (p, held) = craftec_bag_contract::read(&c.params, &c.state).expect("prepared");
+        let cand = BagState::parse(&c.noop, &p).expect("a valid delta");
+        let merged = join(&held, &cand, p.m);
+        let out = merged.encode();
+        // F23: the host re-runs validate over the FULL new state.
+        if craftec_bag_contract::read(&c.params, &out).is_some() {
+            ok += 1;
+        }
+    }
+    ok
+}
+
+/// The control: a bag that should not validate must not.
+#[no_mangle]
+pub extern "C" fn bag_accepts_good_refuses_corrupt(h: u32) -> u32 {
+    let c = bag_case(h);
+    let good = craftec_bag_contract::read(&c.params, &c.state).is_some();
+    let mut bad = c.state.clone();
+    let at = bad.len() / 2;
+    bad[at] ^= 0x01;
+    let refused = craftec_bag_contract::read(&c.params, &bad).is_none();
+    u32::from(good && refused)
+}

@@ -1,0 +1,44 @@
+[package]
+name = "craftec-bag-contract"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Bag: a bounded many-writer collection of unsigned immutable pointers, top-M by work. ARCHITECTURE.md §8."
+
+# Own workspace: own lockfile, so the wasm hash (= part of every register's key) is stable.
+[workspace]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+freenet-stdlib = { version = "0.10.0", features = ["contract"] }
+blake3 = { version = "1", default-features = false }
+# Pinned exactly, not by range: the wasm hash depends on this crate, and
+# `default-features = false` is what selects the full `S < L` scalar check over
+# the three-bit legacy one. A lockfile regeneration must not be able to move
+# strict-verification behaviour underneath a published contract key.
+
+# Test-only: building a SECOND valid signature of one message by hand. Ed25519
+# signing is deterministic per RFC 8032, so a stock signer cannot demonstrate
+# the freedom a key holder actually has. Dev-dependencies never reach the wasm.
+[dev-dependencies]
+craftec-bag-contract = { path = ".", features = ["testing"] }
+curve25519-dalek = "4"
+sha2 = "0.10"
+
+[features]
+default = ["freenet-main-contract"]
+freenet-main-contract = []
+# Fixtures for the tests and for wasm-check. Off by default, so none of it is in
+# the contract's wasm.
+testing = []
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+debug = false

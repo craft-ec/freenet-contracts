@@ -12,6 +12,7 @@ crate-type = ["cdylib"]
 # No default features: the contract's wasm entry points are not wanted here,
 # only the plain function they call.
 craftec-block-contract = { path = "../block", default-features = false }
+craftec-register-contract = { path = "../register", default-features = false, features = ["testing"] }
 freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "3f5bc1a" }
 
 [profile.release]

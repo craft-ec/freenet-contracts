@@ -36,7 +36,33 @@ const time = (fn, runs) => {
   return ns;
 };
 const runs = 2000;
-console.log(`worst case: ${entries} entries, ${len} B state (wasm32, opt-level z + lto)`);
+console.log(`block, worst case: ${entries} entries, ${len} B state (wasm32, opt-level z + lto)`);
 console.log(`  parse + check_node   ${(time(w.well_formed_n, runs) / 1000).toFixed(1)} us`);
 console.log(`  check() (with hash)  ${(time(w.check_n, runs) / 1000).toFixed(1)} us`);
+
+// Register: mode 1, n = 16, k = 16 — sixteen signatures per validation.
+const rh = w.prepare_register();
+const rlen = w.register_state_len(rh);
+if (w.register_accepts_good_refuses_corrupt(rh) !== 1)
+  throw new Error('wasm32: register validation does not separate a good state from a corrupt one');
+const rtime = (() => {
+  w.register_validate_n(rh, 5);
+  const t = process.hrtime.bigint();
+  const ok = w.register_validate_n(rh, 200);
+  const ns = Number(process.hrtime.bigint() - t) / 200;
+  if (ok !== 200) throw new Error(`only ${ok}/200 validated`);
+  return ns;
+})();
+const rep = (fn, runs) => {
+  fn(rh, 5);
+  const t = process.hrtime.bigint();
+  const ok = fn(rh, runs);
+  const ns = Number(process.hrtime.bigint() - t) / runs;
+  if (ok !== runs) throw new Error(`only ${ok}/${runs} succeeded`);
+  return ns;
+};
+console.log(`register, worst case (mode 1, n=16 k=16): ${rlen} B state`);
+console.log(`  validate_state             ${(rtime / 1000).toFixed(0)} us`);
+console.log(`  stale replay, verify late  ${(rep(w.register_stale_replay_n, 200) / 1000).toFixed(0)} us`);
+console.log(`  stale replay, eager        ${(rep(w.register_stale_replay_eager_n, 200) / 1000).toFixed(0)} us`);
 JS

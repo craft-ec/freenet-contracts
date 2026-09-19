@@ -180,21 +180,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "craftec-block-contract"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "freenet-prolly",
- "freenet-stdlib",
-]
-
-[[package]]
 name = "craftec-register-contract"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "curve25519-dalek",
  "ed25519-dalek",
  "freenet-stdlib",
+ "sha2",
 ]
 
 [[package]]
@@ -238,6 +231,7 @@ dependencies = [
  "fiat-crypto",
  "rustc_version",
  "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -410,14 +404,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
-]
-
-[[package]]
-name = "freenet-prolly"
-version = "0.1.0"
-source = "git+https://github.com/craft-ec/freenet-prolly?rev=3f5bc1a#3f5bc1ada0562bee8d65db829b84db2a31910b09"
-dependencies = [
- "blake3",
 ]
 
 [[package]]
@@ -1206,15 +1192,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "wasm-check"
-version = "0.0.0"
-dependencies = [
- "craftec-block-contract",
- "craftec-register-contract",
- "freenet-prolly",
-]
-
-[[package]]
 name = "windows-core"
 version = "0.62.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1281,6 +1258,12 @@ checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
 dependencies = [
  "windows-link",
 ]
+
+[[package]]
+name = "zeroize"
+version = "1.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e13c156562582aa81c60cb29407084cdb54c4164760106ab78e6c5b0858cf64e"
 
 [[package]]
 name = "zmij"

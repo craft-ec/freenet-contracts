@@ -12,9 +12,9 @@ pub const MAGIC: &[u8; 4] = b"RG01";
 /// can never be read as a signed message or the reverse.
 pub const SIG_DOMAIN: &[u8; 8] = b"RG01-sig";
 pub const MAX_LABEL: usize = 64;
-/// A terminal record's value is the successor register's contract instance id,
-/// and nothing else. Fixing the length lets a host reject a "moved-to" that
-/// points at something which cannot be a contract.
+/// A terminal record's value is the successor's IDENTITY — `BLAKE3("RG01-succ"
+/// ‖ params)`, see [`crate::succ`] — never a Freenet instance id, which names
+/// CODE and so would die on upgrade. The length is what a host checks.
 pub const TERMINAL_VALUE_LEN: usize = 32;
 pub const MAX_VALUE: usize = 4096;
 pub const MAX_N: usize = 16;
@@ -398,8 +398,8 @@ impl Record {
         }
         let (value, rest) = rest.split_at_checked(vlen)?;
         let terminal = canonical_bool(terminal)?;
-        // A terminal record's value IS the successor's contract instance id, so
-        // a host can refuse a "moved-to" that cannot point at a contract.
+        // A terminal record's value IS the successor's IDENTITY (see
+        // TERMINAL_VALUE_LEN), so a host refuses one that cannot name a register.
         if terminal && vlen != TERMINAL_VALUE_LEN {
             return None;
         }

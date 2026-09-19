@@ -1,0 +1,24 @@
+[package]
+name = "wasm-check"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Times the block contract's validation inside wasm32, where it runs."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# No default features: the contract's wasm entry points are not wanted here,
+# only the plain function they call.
+craftec-block-contract = { path = "../block", default-features = false }
+freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "3f5bc1a" }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[workspace]

@@ -123,6 +123,22 @@ for (const [m, pay] of [[256, 256], [1024, 256], [256, 48], [1024, 48]]) {
 console.log('  (on the PEER-BROADCAST path a byte-identical replay is dropped before any wasm — F24b — so it costs 0 there;');
 console.log('   through the client API in local mode an identical payload was measured running FULL validation, so it costs a validate_state)');
 
+console.log('pack, the two ends of the format, wasm32:');
+console.log('  case                                   members     state   validate_state');
+for (const [what, mk] of [['most members (smallest distinct bodies)', 'pack_prepare_many'],
+                          ['most bytes (largest members)', 'pack_prepare_large']]) {
+  const h = w[mk]();
+  if (w.pack_accepts_good_refuses_corrupt(h) !== 1)
+    throw new Error('wasm32: pack validation does not separate a good pack from a corrupt one');
+  const v = time(w.pack_validate_n, h, 20);
+  console.log(
+    `  ${what.padEnd(38)} ${String(w.pack_members(h)).padStart(6)} ${String(w.pack_state_len(h)).padStart(9)} B ` +
+    `${(v / 1000).toFixed(2).padStart(10)} ms`
+  );
+}
+console.log('  (a pack cannot hold a megabyte of minimum-size members: count is a u16 and members must be');
+console.log('   DISTINCT, so the most per-member work available is 65,535 small bodies, not 1 MiB of them)');
+
 console.log('set, worst case (both tiers full, 256 B payloads, every cap-holder item carrying its grant), wasm32:');
 console.log('  M     items    state      summary   validate_state   one no-op update (absorb + F23 validate)');
 for (const m of [16, 64]) {

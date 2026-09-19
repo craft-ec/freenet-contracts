@@ -23,6 +23,9 @@ freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "eb
 [features]
 default = ["freenet-main-contract"]
 freenet-main-contract = []
+# The pack's work counters, for the tests and for wasm-check. Off by default,
+# so none of it is in the contract's wasm.
+testing = []
 
 [profile.release]
 opt-level = "z"

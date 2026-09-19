@@ -317,7 +317,7 @@ pub extern "C" fn bag_summary_len(h: u32) -> u32 {
     use craftec_bag_contract::merge::summarize;
     let c = bag_case(h);
     let (p, s) = craftec_bag_contract::read(&c.params, &c.state).expect("prepared");
-    summarize(&s, p.m).len() as u32
+    summarize(&s).len() as u32
 }
 
 /// `validate_state` over the whole bag: what F23 charges per admitted update,

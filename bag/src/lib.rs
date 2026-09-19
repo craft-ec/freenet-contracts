@@ -171,10 +171,13 @@ impl ContractInterface for Bag {
         parameters: Parameters<'static>,
         state: State<'static>,
     ) -> Result<StateSummary<'static>, ContractError> {
-        let Some((p, s)) = read(parameters.as_ref(), state.as_ref()) else {
+        // The params are still parsed and the state still checked against
+        // them; only the summary no longer needs `M`, now that fullness is
+        // derived from the count rather than carried.
+        let Some((_, s)) = read(parameters.as_ref(), state.as_ref()) else {
             return Err(ContractError::InvalidState);
         };
-        Ok(StateSummary::from(summarize(&s, p.m)))
+        Ok(StateSummary::from(summarize(&s)))
     }
 
     fn get_state_delta(
@@ -199,8 +202,7 @@ mod tests {
     use super::*;
     use crate::merge::{collect, delta, join, summarize};
     use crate::testing::{many, params};
-    use crate::wire::{BagState, Held, HASHED, HASH_LEN};
-    use std::sync::atomic::Ordering;
+    use crate::wire::{hashed, BagState, Held, HASH_LEN};
 
     /// The length check refuses a huge state before a single name is hashed.
     ///
@@ -215,9 +217,9 @@ mod tests {
         let good = s.encode();
         let ps = p.encode();
 
-        HASHED.store(0, Ordering::Relaxed);
+        hashed::reset();
         assert!(read(&ps, &good).is_some());
-        let honest = HASHED.load(Ordering::Relaxed);
+        let honest = hashed::count();
         assert_eq!(honest, 64, "an honest read hashes one name per pointer");
 
         // A valid bag with megabytes stapled to the end.
@@ -225,27 +227,27 @@ mod tests {
         hostile.extend(std::iter::repeat_n(0u8, MAX_STATE + 1_000_000));
         assert!(hostile.len() > MAX_STATE);
 
-        HASHED.store(0, Ordering::Relaxed);
+        hashed::reset();
         assert!(
             read(&ps, &hostile).is_none(),
             "trailing bytes must be refused"
         );
         assert_eq!(
-            HASHED.load(Ordering::Relaxed),
+            hashed::count(),
             0,
             "{} B of padding cost {} names hashed; the length check should have \
              decided first",
             hostile.len(),
-            HASHED.load(Ordering::Relaxed)
+            hashed::count()
         );
 
         // And the control: with the length check bypassed, the same input costs
         // a full parse. This is what the guard is worth.
-        HASHED.store(0, Ordering::Relaxed);
+        hashed::reset();
         let p2 = Params::parse(&ps).expect("params");
         assert!(BagState::parse(&hostile, &p2).is_none());
         assert_eq!(
-            HASHED.load(Ordering::Relaxed),
+            hashed::count(),
             honest,
             "without the length check the parser hashes every name before \
              noticing the padding"
@@ -262,15 +264,15 @@ mod tests {
     /// is a price and not an answer.
     #[test]
     fn an_oversized_summary_is_refused_before_it_is_sorted() {
-        use crate::merge::SUMMARY_ENTRIES;
+        use crate::merge::summary_entries;
         let p = params(0, 64);
         let mine = collect(many(&p, 64, 23), &p);
-        let honest = summarize(&mine, p.m);
+        let honest = summarize(&mine);
 
-        SUMMARY_ENTRIES.store(0, Ordering::Relaxed);
+        summary_entries::reset();
         assert!(delta(&mine, &honest, p.m).is_some());
         assert_eq!(
-            SUMMARY_ENTRIES.load(Ordering::Relaxed),
+            summary_entries::count(),
             64,
             "an honest summary copies one truncation per pointer"
         );
@@ -287,13 +289,13 @@ mod tests {
             hostile.extend_from_slice(&t);
         }
         assert!(hostile.len() > 1_000_000, "{} B", hostile.len());
-        SUMMARY_ENTRIES.store(0, Ordering::Relaxed);
+        summary_entries::reset();
         assert!(
             delta(&mine, &hostile, p.m).is_none(),
             "a summary of more than m truncations is not a summary of this bag"
         );
         assert_eq!(
-            SUMMARY_ENTRIES.load(Ordering::Relaxed),
+            summary_entries::count(),
             0,
             "{} B of summary was copied before being refused",
             hostile.len()
@@ -328,7 +330,7 @@ mod tests {
                 held: mine.held[..have].to_vec(),
             };
             assert!((theirs.held.len() as u16) < p.m, "the peer must have room");
-            let d = delta(&mine, &summarize(&theirs, p.m), p.m).expect("a summary");
+            let d = delta(&mine, &summarize(&theirs), p.m).expect("a summary");
 
             // Everything the sender holds and the peer lacks — no filtering by
             // rank, because a peer with room can use any of it.
@@ -349,12 +351,65 @@ mod tests {
         // The lowest-ranked pointer is sent too, even though a FULL peer would
         // have refused it — that is the whole difference the flag makes.
         let empty = BagState::default();
-        let d = delta(&mine, &summarize(&empty, p.m), p.m).expect("a summary");
+        let d = delta(&mine, &summarize(&empty), p.m).expect("a summary");
         let lowest = mine.held.last().expect("full");
         assert!(
             d.held.iter().any(|h| h.name == lowest.name),
             "a peer with room was not sent the cheapest pointer"
         );
         let _ = Held::of(pool[0].clone(), &p.hash());
+    }
+}
+
+/// The cost counters are per-thread, and this is what that buys.
+///
+/// The harness runs a binary's tests on many threads. A process-global counter
+/// reports the work of every thread to every reader, so `assert_eq!(count(), 0)`
+/// after a replayed pointer is a race: it passes when the other tests happen to
+/// be elsewhere and fails when they are not. Nothing in a green run says which.
+///
+/// The failure is made DETERMINISTIC here by two barriers. Every thread waits
+/// until all of them are ready, does its own fixed amount of counted work, and
+/// waits again until all of them have finished — only then does it read. With a
+/// per-thread counter each thread reads exactly its own `PER_THREAD`; with a
+/// shared one every thread would read `THREADS * PER_THREAD`, every time,
+/// because all the work is provably done before any read happens.
+///
+/// So this test fails deterministically against the old `static AtomicUsize`,
+/// which is what a control has to do to be worth having.
+#[cfg(test)]
+mod counter_scope {
+    use crate::merge::collect;
+    use crate::testing::{many, params};
+    use crate::wire::hashed;
+    use std::sync::Barrier;
+
+    const THREADS: usize = 4;
+    const PER_THREAD: usize = 32;
+
+    #[test]
+    fn a_cost_counter_reports_this_threads_work_and_no_other_threads() {
+        let ready = Barrier::new(THREADS);
+        let done = Barrier::new(THREADS);
+        std::thread::scope(|s| {
+            for _ in 0..THREADS {
+                s.spawn(|| {
+                    let p = params(0, PER_THREAD as u16);
+                    let ptrs = many(&p, PER_THREAD, 1);
+                    assert_eq!(ptrs.len(), PER_THREAD, "the fixture must do real work");
+                    hashed::reset();
+                    ready.wait();
+                    let bag = collect(ptrs, &p);
+                    assert!(!bag.held.is_empty());
+                    // Every thread's work is finished before any thread reads.
+                    done.wait();
+                    assert_eq!(
+                        hashed::count(),
+                        PER_THREAD,
+                        "the counter reported other threads' work: it is not per-thread"
+                    );
+                });
+            }
+        });
     }
 }

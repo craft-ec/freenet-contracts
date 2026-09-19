@@ -9,9 +9,23 @@ use crate::wire::{BagState, Held, Params, Pointer, HASH_LEN, TRUNC};
 
 /// Truncations copied out of a summary. A summary arrives from a stranger and
 /// is SORTED, so its length is work it can impose on every host — counted so a
-/// test can assert the price of refusing one.
-#[cfg(test)]
-pub static SUMMARY_ENTRIES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// test can assert the price of refusing one. Thread-local for the reason given
+/// on [`crate::wire::hashed`].
+#[cfg(any(test, feature = "testing"))]
+pub mod summary_entries {
+    use core::cell::Cell;
+    thread_local! { static N: Cell<usize> = const { Cell::new(0) }; }
+    /// Truncations copied on this thread since the last [`reset`].
+    pub fn count() -> usize {
+        N.with(|n| n.get())
+    }
+    pub fn reset() {
+        N.with(|n| n.set(0));
+    }
+    pub(crate) fn tick() {
+        N.with(|n| n.set(n.get() + 1));
+    }
+}
 
 /// `union, then keep the best M`.
 ///
@@ -32,17 +46,21 @@ pub fn join(a: &BagState, b: &BagState, m: u16) -> BagState {
 
 /// What a peer needs to know to ask for what it lacks.
 ///
-/// `count(2) ‖ full(1) ‖ lowest work(1) ‖ lowest name(32) ‖ trunc*`, the
-/// truncations sorted.
+/// `count(2) ‖ lowest work(1) ‖ lowest name(32) ‖ trunc*`, the truncations
+/// sorted.
 ///
-/// **`count` and `full` are claims a stranger can buy**, not facts: a bag is
-/// filled by whoever pays the work. The lowest kept carries the FULL name, not
+/// **There is no fullness flag.** A bag is full exactly when its count equals
+/// `M`, and `M` is in the params, so a flag would be a second encoding of a
+/// fact already on the wire — and one encoding per fact is the rule this format
+/// is built on. The reader derives it.
+///
+/// **`count` is a claim a stranger can buy**, not a fact: a bag is filled by
+/// whoever pays the work. The lowest kept carries the FULL name, not
 /// a truncation — at equal work a truncated name would leave the boundary
 /// undecidable, and work ties are ordinary.
-pub fn summarize(s: &BagState, m: u16) -> Vec<u8> {
+pub fn summarize(s: &BagState) -> Vec<u8> {
     let mut out = Vec::with_capacity(4 + HASH_LEN + s.held.len() * TRUNC);
     out.extend_from_slice(&(s.held.len() as u16).to_le_bytes());
-    out.push(u8::from(s.held.len() as u16 >= m));
     match s.held.last() {
         Some(low) => {
             out.push(low.work.min(u8::MAX as u32) as u8);
@@ -65,6 +83,9 @@ pub fn summarize(s: &BagState, m: u16) -> Vec<u8> {
 
 /// A summary as the sender reads it.
 pub struct Summary {
+    /// How many truncations follow — a claim, cross-checked against the body.
+    pub count: u16,
+    /// Derived from `count` and `M`, never carried on the wire.
     pub full: bool,
     pub lowest: (u32, [u8; HASH_LEN]),
     /// Sorted, for a binary search per candidate.
@@ -75,7 +96,7 @@ impl Summary {
     /// Read a peer's summary. `m` is this bag's capacity, which is in the
     /// params and therefore the same for both sides.
     pub fn parse(b: &[u8], m: u16) -> Option<Summary> {
-        let (head, rest) = b.split_at_checked(2 + 1 + 1 + HASH_LEN)?;
+        let (head, rest) = b.split_at_checked(2 + 1 + HASH_LEN)?;
         if rest.len() % TRUNC != 0 {
             return None;
         }
@@ -94,12 +115,12 @@ impl Summary {
             return None;
         }
         let mut lowest = [0u8; HASH_LEN];
-        lowest.copy_from_slice(&head[4..]);
+        lowest.copy_from_slice(&head[3..]);
         let mut trunc: Vec<[u8; TRUNC]> = rest
             .chunks_exact(TRUNC)
             .map(|c| {
-                #[cfg(test)]
-                SUMMARY_ENTRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                #[cfg(any(test, feature = "testing"))]
+                summary_entries::tick();
                 c.try_into().expect("chunk")
             })
             .collect();
@@ -108,8 +129,12 @@ impl Summary {
         // scan per candidate.
         trunc.sort_unstable();
         Some(Summary {
-            full: head[2] != 0,
-            lowest: (head[3] as u32, lowest),
+            // Derived, never carried. `count` is already cross-checked against
+            // the number of truncations that follow, and the bound above makes
+            // it at most `m`, so "full" is exactly "count reached the cap".
+            count,
+            full: count >= m,
+            lowest: (head[2] as u32, lowest),
             trunc,
         })
     }

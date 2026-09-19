@@ -222,7 +222,7 @@ fn a_delta_is_what_the_peer_lacks_and_can_use() {
     let theirs = collect(pool[20..].iter().cloned(), &p);
 
     for (what, from, to) in [("a to b", &mine_, &theirs), ("b to a", &theirs, &mine_)] {
-        let sum = summarize(to, p.m);
+        let sum = summarize(to);
         let d = delta(from, &sum, p.m).expect("a well-formed summary");
         // Nothing the peer already has.
         for h in &d.held {
@@ -300,7 +300,7 @@ fn an_eight_byte_collision_does_not_hide_a_pointer() {
     let mut mine_v = vec![a.clone(), b.clone()];
     mine_v.sort_by_key(|h| h.rank());
     let mine_ = BagState { held: mine_v };
-    let d = delta(&mine_, &summarize(&theirs, p.m), p.m).unwrap();
+    let d = delta(&mine_, &summarize(&theirs), p.m).unwrap();
     assert!(
         d.held.iter().any(|h| h.name == b.name),
         "a pointer was hidden by an 8-byte agreement"

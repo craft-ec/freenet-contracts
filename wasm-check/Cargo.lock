@@ -1067,6 +1067,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "wasm-check"
+version = "0.0.0"
+dependencies = [
+ "craftec-block-contract",
+ "freenet-prolly",
+]
+
+[[package]]
 name = "windows-core"
 version = "0.62.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

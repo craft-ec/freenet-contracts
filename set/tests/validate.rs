@@ -279,9 +279,13 @@ fn params_are_refused_unless_canonical() {
         f(&mut b);
         b
     };
-    let at = 4 + 32;
+    let at = 5 + 32;
     for (what, b) in [
         ("no magic", with(&|b| b[0] = b'X')),
+        // The reserved mode byte: a Set written for a mode this build does not
+        // implement must not be read as one it does.
+        ("an unimplemented mode", with(&|b| b[4] = 1)),
+        ("another unimplemented mode", with(&|b| b[4] = 255)),
         ("unknown admission", with(&|b| b[at] = 9)),
         (
             "m = 0",

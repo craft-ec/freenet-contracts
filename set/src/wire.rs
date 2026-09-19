@@ -119,6 +119,17 @@ pub enum Admission {
     Cap,
 }
 
+/// The only `mode` this build accepts.
+///
+/// The byte is RESERVED, not decorative: a later epoch wants a Set whose rank
+/// is `BLAKE3("dir-rank" ‖ key)` rather than slot work, with work demoted to an
+/// admission threshold, so that an implicit trie of Sets can act as a directory
+/// with no writer (#19). Reserving it now makes that a parameterisation of this
+/// contract instead of a fifth contract kind. Anything other than `0` is
+/// refused at parse, so a state written for a mode this build does not
+/// implement can never be mistaken for one it does.
+pub const MODE_CURRENT: u8 = 0;
+
 /// What a set is, fixed in its contract key.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Params {
@@ -137,7 +148,7 @@ pub struct Params {
     pub label: Vec<u8>,
 }
 
-const PARAMS_FIXED: usize = 4 + KEY_LEN + 1 + 2 + 2 + 1 + 2 + 4;
+const PARAMS_FIXED: usize = 4 + 1 + KEY_LEN + 1 + 2 + 2 + 1 + 2 + 4;
 
 impl Params {
     pub fn parse(b: &[u8]) -> Option<Params> {
@@ -145,8 +156,13 @@ impl Params {
         if &head[..4] != MAGIC || label.len() > MAX_LABEL {
             return None;
         }
-        let owner = usable_key(&head[4..4 + KEY_LEN])?;
-        let at = 4 + KEY_LEN;
+        // Reserved: one accepted value, so there is nothing to carry in the
+        // struct and nothing two encodings could disagree about.
+        if head[4] != MODE_CURRENT {
+            return None;
+        }
+        let owner = usable_key(&head[5..5 + KEY_LEN])?;
+        let at = 5 + KEY_LEN;
         let admission = match head[at] {
             0 => Admission::OwnerOnly,
             1 => Admission::Cap,
@@ -177,6 +193,7 @@ impl Params {
 
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::from(&MAGIC[..]);
+        out.push(MODE_CURRENT);
         out.extend_from_slice(self.owner.as_bytes());
         out.push(match self.admission {
             Admission::OwnerOnly => 0,

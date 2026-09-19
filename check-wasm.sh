@@ -122,4 +122,20 @@ for (const [m, pay] of [[256, 256], [1024, 256], [256, 48], [1024, 48]]) {
 }
 console.log('  (on the PEER-BROADCAST path a byte-identical replay is dropped before any wasm — F24b — so it costs 0 there;');
 console.log('   through the client API in local mode an identical payload was measured running FULL validation, so it costs a validate_state)');
+
+console.log('set, worst case (both tiers full, 256 B payloads, every cap-holder item carrying its grant), wasm32:');
+console.log('  M     items    state      summary   validate_state   one no-op update (absorb + F23 validate)');
+for (const m of [16, 64]) {
+  const h = w.set_prepare(m);
+  if (w.set_items(h) !== 2 * m) throw new Error(`set_prepare(${m}) built ${w.set_items(h)} items, wanted ${2 * m}`);
+  if (w.set_accepts_good_refuses_corrupt(h) !== 1)
+    throw new Error('wasm32: validation does not separate a good set from a corrupt one');
+  const runs = m === 16 ? 200 : 60;
+  const v = time(w.set_validate_n, h, runs);
+  const d = time(w.set_noop_delta_n, h, runs);
+  console.log(
+    `  ${String(m).padEnd(5)} ${String(w.set_items(h)).padStart(5)}  ${String(w.set_state_len(h)).padStart(8)} B  ` +
+    `${String(w.set_summary_len(h)).padStart(6)} B   ${v.toFixed(0).padStart(8)} us   ${d.toFixed(0).padStart(10)} us`
+  );
+}
 JS

@@ -367,3 +367,121 @@ pub extern "C" fn bag_accepts_good_refuses_corrupt(h: u32) -> u32 {
     let refused = craftec_bag_contract::read(&c.params, &bad).is_none();
     u32::from(good && refused)
 }
+
+// ---------------------------------------------------------------- Set -----
+//
+// The cost that matters for a Set is the one the host pays on EVERY accepted
+// update and on every no-op one: a full `validate_state`, which verifies every
+// signature in the state (F23, F24). That is what fixes M at 64.
+
+struct SetCase {
+    params: Vec<u8>,
+    state: Vec<u8>,
+    noop: Vec<u8>,
+    items: u32,
+}
+
+static mut SET_CASES: Vec<SetCase> = Vec::new();
+
+/// A Set filled to capacity in BOTH tiers: `M` slots the owner signed and `M`
+/// signed by capability holders, every one of which carries its grant. That is
+/// the most signatures a state of this shape can ask a host to check.
+#[no_mangle]
+pub extern "C" fn set_prepare(m: u32) -> u32 {
+    use craftec_set_contract::testing::world_with;
+    use craftec_set_contract::wire::Admission;
+    let w = world_with(1, 4, Admission::Cap, m as u16, m as u16, 0);
+    let mut items = Vec::new();
+    for i in 0..m {
+        items.push(w.item(0, &i.to_le_bytes(), 1, &[0xab; 256]));
+    }
+    for i in 0..m {
+        // Spread over the three capability holders.
+        let who = 1 + (i % 3) as usize;
+        items.push(w.item(who, &i.to_le_bytes(), 1, &[0xcd; 256]));
+    }
+    let s = w.state(items);
+    let state = s.encode();
+    // A no-op: one item already held, replayed. The host still runs a full
+    // validation of the result (F24), which is the whole point of measuring it.
+    let one = craftec_set_contract::wire::SetState {
+        deny: Vec::new(),
+        held: vec![s.held[0].clone()],
+    };
+    let case = SetCase {
+        params: w.params_bytes.clone(),
+        state,
+        noop: one.encode(),
+        items: s.held.len() as u32,
+    };
+    unsafe {
+        let v = &mut *core::ptr::addr_of_mut!(SET_CASES);
+        v.push(case);
+        (v.len() - 1) as u32
+    }
+}
+
+fn set_case(h: u32) -> &'static SetCase {
+    unsafe { &(&*core::ptr::addr_of!(SET_CASES))[h as usize] }
+}
+
+#[no_mangle]
+pub extern "C" fn set_items(h: u32) -> u32 {
+    set_case(h).items
+}
+
+#[no_mangle]
+pub extern "C" fn set_state_len(h: u32) -> u32 {
+    set_case(h).state.len() as u32
+}
+
+#[no_mangle]
+pub extern "C" fn set_summary_len(h: u32) -> u32 {
+    use craftec_set_contract::merge::summarize;
+    let c = set_case(h);
+    let (p, s) = craftec_set_contract::read_unverified(&c.params, &c.state).expect("prepared");
+    summarize(&s, &p).len() as u32
+}
+
+/// One full `validate_state`: every signature in the state, every time.
+#[no_mangle]
+pub extern "C" fn set_validate_n(h: u32, runs: u32) -> u32 {
+    let c = set_case(h);
+    let mut ok = 0;
+    for _ in 0..runs {
+        if craftec_set_contract::read(&c.params, &c.state).is_some() {
+            ok += 1;
+        }
+    }
+    ok
+}
+
+/// One no-op update: an item the state already holds, merged, and the result
+/// re-validated in full as the host does.
+#[no_mangle]
+pub extern "C" fn set_noop_delta_n(h: u32, runs: u32) -> u32 {
+    let c = set_case(h);
+    let mut ok = 0;
+    for _ in 0..runs {
+        let (p, held) = craftec_set_contract::read_unverified(&c.params, &c.state).expect("held");
+        let cand = craftec_set_contract::wire::SetState::parse_unverified(&c.noop, &p)
+            .expect("the replayed item");
+        let out = craftec_set_contract::absorb(&held, cand, &p).encode();
+        if craftec_set_contract::read(&c.params, &out).is_some() {
+            ok += 1;
+        }
+    }
+    ok
+}
+
+/// The control: a Set that should not validate must not.
+#[no_mangle]
+pub extern "C" fn set_accepts_good_refuses_corrupt(h: u32) -> u32 {
+    let c = set_case(h);
+    let good = craftec_set_contract::read(&c.params, &c.state).is_some();
+    let mut bad = c.state.clone();
+    let at = bad.len() / 2;
+    bad[at] ^= 0x01;
+    let refused = craftec_set_contract::read(&c.params, &bad).is_none();
+    u32::from(good && refused)
+}

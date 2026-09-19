@@ -7,7 +7,7 @@ lockfile, because a contract's wasm hash is part of its network key.
 |---|---|---|
 | `block` | immutable, hash-keyed bytes | built |
 | `register` | one signed value per writer (key or k-of-n keyset) | built |
-| `set` | union of signed items | phase 2 |
+| `set` | union of signed items, admitted by capability | built |
 | `bag` | unsigned immutable pointers, top-M by work | built |
 
 `./build.sh` → `build/*.wasm` (reproducible); `./hash-gate.sh` proves it is;

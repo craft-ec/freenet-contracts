@@ -2,10 +2,10 @@
 # What a contract's wasm hash must NOT depend on.
 #
 # The hash is part of the contract's network key, so anything it moves with is
-# something that re-keys every instance in existence. This gate asserts three
+# something that re-keys every instance in existence. This gate asserts
 # PROPERTIES rather than a constant: a pinned expected hash would go red on
 # every legitimate code change, and the person who then bumps it has silently
-# declared an epoch. The released hashes live in RELEASED.md and are never
+# declared an epoch. The released hashes live in `released.toml` and are never
 # compared against here.
 #
 #   a   two clean builds of the same tree, at the same path, are equal
@@ -13,6 +13,12 @@
 #   b2  a build with a different absolute cargo home is equal
 #   c   a build with a blank line inserted at the top of every source file of
 #       the crate is equal — i.e. a comment edit does not re-key the contract
+#
+# and then, on a build made with the remaps and NO location strip — the only
+# build in which the remaps are visible at all — that no cargo index-hash
+# directory, no revision-named git checkout and no `$HOME` reached the binary,
+# with floors of at least one `/registry/` path and, where the contract has a
+# git dependency, at least one `/dep/`.
 #
 # Each property is run twice: once as built (must hold) and once with the
 # hardening switched off through `CONTRACT_BUILD_UNHARDENED=1` (the control).
@@ -22,7 +28,9 @@
 # the local crate's files relative to its package directory) and the control is
 # recorded as equal.
 #
-# Roughly ten clean wasm builds per contract; about a minute each.
+# Eleven clean wasm builds per contract. Each build's target directory is
+# freed as soon as its wasm has been hashed, because holding them all costs
+# tens of gigabytes at four contracts.
 set -euo pipefail
 cd "$(dirname "$0")"
 root=$PWD
@@ -54,23 +62,22 @@ perturb() {
   printf '%s' "$n"
 }
 
-# Source paths of the crate ITSELF that reached the binary. Cargo passes the
-# local crate's files RELATIVE to its package directory, so those are the only
-# `.rs` strings in the wasm that are not absolute — everything else is std
-# (`/rustc/…`), a dependency (`/dep/…`) or the registry (`/registry/…`).
+# Every ABSOLUTE source path in the binary, whole — std, dependencies and the
+# registry. Whole, and anchored where it is matched, because
+# `/cargo/registry/src/index.crates.io-…` CONTAINS the substring `/registry/`:
+# a grep for that substring passes while the registry remap does nothing at all.
+abs_paths() {
+  strings -a "$1" | { grep -oE '/[A-Za-z0-9_][A-Za-z0-9_/.-]*\.rs' || true; } | sort -u
+}
+
+# Source paths of the crate ITSELF. Cargo passes the local crate's files
+# RELATIVE to its package directory, so those are the only `.rs` strings in the
+# wasm that are not absolute.
 #
 # This is what decides whether property c's control CAN fail: a crate none of
 # whose own panic locations reach the binary keeps its hash through a comment
 # edit whatever the build flags are, and a control that cannot fail must say
 # which of the two reasons it is.
-# Every absolute source path in the binary, whole. Anchored matching matters
-# here: `/cargo/registry/src/index.crates.io-…` CONTAINS the substring
-# `/registry/`, so a grep for that substring passes while the registry remap is
-# doing nothing at all.
-abs_paths() {
-  strings -a "$1" | { grep -oE '/[A-Za-z0-9_][A-Za-z0-9_/.-]*\.rs' || true; } | sort -u
-}
-
 own_locations() {
   # `|| true`: finding none is the expected answer, not a broken pipeline.
   strings -a "$1" | { grep -oE '(^|[^A-Za-z0-9_/.-])src/[A-Za-z0-9_/-]+\.rs' || true; } |
@@ -92,7 +99,15 @@ build() {
     { echo "hash-gate: build failed ($k $*)" >&2; tail -20 "$log" >&2; exit 1; }
   local w="$d/build/$out.wasm"
   [ -s "$w" ] || { echo "hash-gate: $w missing or empty" >&2; exit 1; }
-  shasum -a 256 "$w" | cut -c1-16
+  local hash
+  hash=$(shasum -a 256 "$w" | cut -c1-16)
+  # Freed as soon as its wasm has been read. The gate makes four checkouts per
+  # contract and builds each of them several times; holding every target
+  # directory at once costs tens of gigabytes once there are four contracts,
+  # and the failure is a build error in the middle of a run rather than
+  # anything the gate reports about hashes.
+  rm -rf "$d/$k/target"
+  printf '%s' "$hash"
 }
 
 checks=0 failures=0
@@ -193,6 +208,10 @@ for k in "${kinds[@]}"; do
     row dep "git dependencies remapped to /dep/<pkg>" "n/a" '?' "n/a"
     echo "      $k has no git dependency path in the binary; nothing to remap"
   fi
+  # This contract is finished with; its four checkouts go now rather than at
+  # the end of the run, so peak disk is one contract's worth and not all of
+  # them together.
+  rm -rf "$base/$k"
 done
 
 echo

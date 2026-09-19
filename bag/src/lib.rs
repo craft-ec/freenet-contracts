@@ -37,8 +37,10 @@
 //! have `work_bits` leading zeros. The params hash is in the preimage, so work
 //! mined for one bag is worthless in another: a pointer cannot be moved between
 //! bags, and the price is paid per bag. Two pointers with the same payload and
-//! different nonces are two pointers — deduplication by what a payload REFERS
-//! to is the reader's job, after resolving it.
+//! different nonces are two pointers — **a consumer dedupes by what the
+//! payload refers to**, after resolving it, because the contract never
+//! interprets a payload and so cannot tell two names for one thing from two
+//! things.
 //!
 //! # Sync, and what a summary gives away
 //!
@@ -100,6 +102,12 @@ pub const MAX_STATE: usize =
     4 + 2 + (MAX_M as usize) * (2 + MAX_PAYLOAD as usize + wire::NONCE_LEN);
 
 /// Parse and fully check a state against its params.
+///
+/// The empty byte string is NOT a valid bag, unlike a Block, whose empty state
+/// is the legitimate "this block holds nothing yet". A bag's smallest state is
+/// `"BG01" ‖ 0` — six bytes saying a bag exists and is empty — so accepting
+/// zero bytes as a second spelling of that would give one logical state two
+/// hashes, and the merge breaks ties on hashes.
 ///
 /// The only reader. `validate_state` and `update_state` both go through it, so
 /// a candidate cannot carry anything a stored state could not.
@@ -174,13 +182,14 @@ impl ContractInterface for Bag {
         state: State<'static>,
         summary: StateSummary<'static>,
     ) -> Result<StateDelta<'static>, ContractError> {
-        let Some((_, s)) = read(parameters.as_ref(), state.as_ref()) else {
+        let Some((p, s)) = read(parameters.as_ref(), state.as_ref()) else {
             return Err(ContractError::InvalidState);
         };
-        // An unreadable summary is treated as an empty peer: sending more than
-        // was needed costs bytes, and refusing would let a malformed summary
-        // stop a sync.
-        let d = delta(&s, summary.as_ref()).unwrap_or_else(|| s.clone());
+        // An unreadable summary — malformed, or longer than a bag of this size
+        // could ever produce — is treated as an empty peer: the whole state is
+        // at most M pointers, so the cost is bounded, and refusing outright
+        // would let a malformed summary stop a sync.
+        let d = delta(&s, summary.as_ref(), p.m).unwrap_or_else(|| s.clone());
         Ok(StateDelta::from(d.encode()))
     }
 }
@@ -190,7 +199,7 @@ mod tests {
     use super::*;
     use crate::merge::{collect, delta, join, summarize};
     use crate::testing::{many, params};
-    use crate::wire::{BagState, Held, HASHED};
+    use crate::wire::{BagState, Held, HASHED, HASH_LEN};
     use std::sync::atomic::Ordering;
 
     /// The length check refuses a huge state before a single name is hashed.
@@ -243,6 +252,65 @@ mod tests {
         );
     }
 
+    /// A summary longer than a bag of this size could produce is refused
+    /// BEFORE it is copied or sorted.
+    ///
+    /// A summary arrives from a stranger and `get_state_delta` sorts it, on
+    /// every host that serves the bag — so its length is work an attacker
+    /// chooses. The bound is `m`, which is in the params and therefore the same
+    /// for both sides. Asserted on truncations copied, because the defect here
+    /// is a price and not an answer.
+    #[test]
+    fn an_oversized_summary_is_refused_before_it_is_sorted() {
+        use crate::merge::SUMMARY_ENTRIES;
+        let p = params(0, 64);
+        let mine = collect(many(&p, 64, 23), &p);
+        let honest = summarize(&mine, p.m);
+
+        SUMMARY_ENTRIES.store(0, Ordering::Relaxed);
+        assert!(delta(&mine, &honest, p.m).is_some());
+        assert_eq!(
+            SUMMARY_ENTRIES.load(Ordering::Relaxed),
+            64,
+            "an honest summary copies one truncation per pointer"
+        );
+
+        // A megabyte of truncations, with the count field AGREEING — otherwise
+        // the count check refuses it first and the length bound is never
+        // reached, which is how a mutant on the bound survived a whole suite.
+        let entries = 65_535usize;
+        let mut hostile = honest[..4 + HASH_LEN].to_vec();
+        hostile[0..2].copy_from_slice(&(entries as u16).to_le_bytes());
+        for i in 0..entries as u32 {
+            let mut t = [0u8; 16];
+            t[..4].copy_from_slice(&i.to_le_bytes());
+            hostile.extend_from_slice(&t);
+        }
+        assert!(hostile.len() > 1_000_000, "{} B", hostile.len());
+        SUMMARY_ENTRIES.store(0, Ordering::Relaxed);
+        assert!(
+            delta(&mine, &hostile, p.m).is_none(),
+            "a summary of more than m truncations is not a summary of this bag"
+        );
+        assert_eq!(
+            SUMMARY_ENTRIES.load(Ordering::Relaxed),
+            0,
+            "{} B of summary was copied before being refused",
+            hostile.len()
+        );
+
+        // The count field must agree with what follows: one spelling.
+        let mut lying = honest.clone();
+        lying[0] = 5;
+        assert!(
+            delta(&mine, &lying, p.m).is_none(),
+            "a lying count was accepted"
+        );
+
+        // And the honest one still works after all that.
+        assert!(delta(&mine, &honest, p.m).is_some());
+    }
+
     /// A peer that is NOT full gets everything it lacks — the sender does not
     /// try to work out which of them will survive the peer's own merge.
     ///
@@ -260,7 +328,7 @@ mod tests {
                 held: mine.held[..have].to_vec(),
             };
             assert!((theirs.held.len() as u16) < p.m, "the peer must have room");
-            let d = delta(&mine, &summarize(&theirs, p.m)).expect("a summary");
+            let d = delta(&mine, &summarize(&theirs, p.m), p.m).expect("a summary");
 
             // Everything the sender holds and the peer lacks — no filtering by
             // rank, because a peer with room can use any of it.
@@ -281,7 +349,7 @@ mod tests {
         // The lowest-ranked pointer is sent too, even though a FULL peer would
         // have refused it — that is the whole difference the flag makes.
         let empty = BagState::default();
-        let d = delta(&mine, &summarize(&empty, p.m)).expect("a summary");
+        let d = delta(&mine, &summarize(&empty, p.m), p.m).expect("a summary");
         let lowest = mine.held.last().expect("full");
         assert!(
             d.held.iter().any(|h| h.name == lowest.name),

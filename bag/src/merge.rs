@@ -7,6 +7,12 @@
 
 use crate::wire::{BagState, Held, Params, Pointer, HASH_LEN, TRUNC};
 
+/// Truncations copied out of a summary. A summary arrives from a stranger and
+/// is SORTED, so its length is work it can impose on every host — counted so a
+/// test can assert the price of refusing one.
+#[cfg(test)]
+pub static SUMMARY_ENTRIES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// `union, then keep the best M`.
 ///
 /// Commutative and associative because the order is total and fixed on names
@@ -66,16 +72,36 @@ pub struct Summary {
 }
 
 impl Summary {
-    pub fn parse(b: &[u8]) -> Option<Summary> {
+    /// Read a peer's summary. `m` is this bag's capacity, which is in the
+    /// params and therefore the same for both sides.
+    pub fn parse(b: &[u8], m: u16) -> Option<Summary> {
         let (head, rest) = b.split_at_checked(2 + 1 + 1 + HASH_LEN)?;
         if rest.len() % TRUNC != 0 {
+            return None;
+        }
+        // A bag holds at most `m` pointers, so a summary of more than `m`
+        // truncations is not a summary of a bag. Checked BEFORE anything is
+        // copied or sorted: a stranger's multi-megabyte summary would
+        // otherwise buy a large sort inside `get_state_delta` on every host
+        // that serves it.
+        if rest.len() > m as usize * TRUNC {
+            return None;
+        }
+        let count = u16::from_le_bytes([head[0], head[1]]);
+        // One spelling: the count must be the number of truncations that
+        // follow. An unused field is a field two encodings can disagree on.
+        if count as usize != rest.len() / TRUNC {
             return None;
         }
         let mut lowest = [0u8; HASH_LEN];
         lowest.copy_from_slice(&head[4..]);
         let mut trunc: Vec<[u8; TRUNC]> = rest
             .chunks_exact(TRUNC)
-            .map(|c| c.try_into().expect("chunk"))
+            .map(|c| {
+                #[cfg(test)]
+                SUMMARY_ENTRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                c.try_into().expect("chunk")
+            })
             .collect();
         // A stranger's summary need not arrive sorted; sorting it here costs
         // one sort and makes the lookup below a binary search rather than a
@@ -115,8 +141,8 @@ impl Summary {
 }
 
 /// The pointers this state holds that the peer lacks and can use.
-pub fn delta(s: &BagState, summary: &[u8]) -> Option<BagState> {
-    let sum = Summary::parse(summary)?;
+pub fn delta(s: &BagState, summary: &[u8], m: u16) -> Option<BagState> {
+    let sum = Summary::parse(summary, m)?;
     Some(BagState {
         held: s
             .held

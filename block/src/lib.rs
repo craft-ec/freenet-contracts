@@ -135,8 +135,19 @@ fn well_formed(kind: u8, body: &[u8]) -> bool {
         // function, one level down: a host that unpacks can never produce a
         // block this contract would refuse.
         kind::PACK => pack::well_formed(body),
-        // Formats not landed yet: any body, as before.
-        kind::RAW | kind::MEDIA_CHUNK | kind::FRAGMENT | kind::PARITY | kind::SCHEMA => true,
+        // Bytes with no structure to check. `RAW` is the only kind that is
+        // MEANT to be arbitrary: it is the value blob, and its bounds are its
+        // length and its hash.
+        kind::RAW => true,
+        // Reserved, not landed, and therefore REFUSED — including the four
+        // whose bytes are frozen. A kind that accepts any body is a second
+        // `RAW` under another name, and once an epoch is released that is a
+        // promise every host keeps whatever is labelled with it. Each begins
+        // validating when its rule lands: `PARITY` with the parity rule
+        // (freenet-prolly#19, phase 4), `MEDIA_CHUNK` and `FRAGMENT` with files
+        // and media (phase 5, the same Block-code epoch as parity), `SCHEMA`
+        // with schemas. The BYTES stay frozen and reserved meanwhile — what is
+        // refused is the content, never the number.
         _ => false,
     }
 }
@@ -1121,5 +1132,93 @@ mod pack_cost_tests {
             &build(&[(kind::RAW, Vec::new())]).expect("buildable"),
         );
         assert!(check(blake3::hash(&alone).as_bytes(), &alone));
+    }
+}
+
+#[cfg(test)]
+mod reserved_kind_tests {
+    use super::tests::*;
+    use super::*;
+
+    /// The kinds whose bytes are reserved but whose formats have not landed.
+    const NOT_LANDED: [(&str, u8); 4] = [
+        ("MEDIA_CHUNK", kind::MEDIA_CHUNK),
+        ("FRAGMENT", kind::FRAGMENT),
+        ("PARITY", kind::PARITY),
+        ("SCHEMA", kind::SCHEMA),
+    ];
+
+    fn accepted_at_every_door(state: &[u8]) -> bool {
+        let p = params_of(state);
+        let v = validate(p.clone(), state.to_vec()) == ValidateResult::Valid;
+        let adopted = update(p.clone(), Vec::new(), vec![state.to_vec()]) == state;
+        assert!(
+            Block::summarize_state(p.clone(), State::from(state.to_vec())).is_ok(),
+            "the read doors must not error"
+        );
+        assert_eq!(v, adopted, "validate and update disagree about this state");
+        v
+    }
+
+    /// A kind that accepts any body is a second `RAW` under another name. Today
+    /// that is free; once an epoch is released it is a promise that every host
+    /// keeps whatever is labelled with it, and taking that back costs an epoch.
+    ///
+    /// The BYTES stay reserved — `kind_bytes_are_frozen` still pins them. What
+    /// is refused is the content, never the number.
+    #[test]
+    fn a_kind_whose_format_has_not_landed_is_refused_at_every_door() {
+        for (name, k) in NOT_LANDED {
+            for body in [b"".as_slice(), b"anything".as_slice(), &[0u8; 4096]] {
+                let s = encode(k, body);
+                assert!(
+                    !accepted_at_every_door(&s),
+                    "{name} ({k}) accepted a {}-byte body",
+                    body.len()
+                );
+            }
+        }
+        // The control: the kinds that HAVE landed are still accepted, so the
+        // refusals above are about these four and not about the door being
+        // shut. An empty body, an ordinary one, and a full-size one each.
+        for (name, k, body) in [
+            ("RAW", kind::RAW, Vec::new()),
+            ("RAW", kind::RAW, b"a value".to_vec()),
+            ("RAW", kind::RAW, vec![0xab; MAX_BODY]),
+            ("TREE_NODE", kind::TREE_NODE, leaf_node()),
+        ] {
+            assert!(
+                accepted_at_every_door(&encode(k, &body)),
+                "{name} must still be accepted"
+            );
+        }
+        let p = encode(
+            kind::PACK,
+            &pack::build(&[(kind::RAW, b"x".to_vec())]).expect("buildable"),
+        );
+        assert!(accepted_at_every_door(&p), "PACK must still be accepted");
+    }
+
+    /// An unknown kind — one with no reserved byte at all — was already refused
+    /// and stays refused. Pinned beside the four so that a future change which
+    /// accidentally widens the accepting arm fails here too.
+    #[test]
+    fn a_kind_with_no_reserved_byte_is_refused() {
+        for k in [7u8, 8, 64, 200, 255] {
+            assert!(!accepted_at_every_door(&encode(k, b"anything")));
+        }
+    }
+
+    /// A reserved kind cannot ride inside a pack either, and it is refused
+    /// there for its OWN reason rather than only by the member allowlist —
+    /// otherwise removing the allowlist would quietly re-admit it.
+    #[test]
+    fn a_reserved_kind_is_refused_inside_a_pack_by_well_formed_too() {
+        for (name, k) in NOT_LANDED {
+            assert!(
+                !well_formed(k, b"anything"),
+                "{name} must be refused by well_formed itself"
+            );
+        }
     }
 }

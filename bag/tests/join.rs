@@ -1,6 +1,6 @@
 //! The merge is a join, or the bag is not a CRDT. Laws first.
 
-use craftec_bag_contract::merge::{collect, join, summarize};
+use craftec_bag_contract::merge::{collect, join, summarize, Summary};
 use craftec_bag_contract::testing::{many, mine, params};
 use craftec_bag_contract::wire::{BagState, Held, Params, Pointer};
 
@@ -251,20 +251,32 @@ fn replicas_converge_under_gossip() {
 }
 
 /// A summary is what a peer reads; it must say what the bag holds.
+///
+/// Fullness is DERIVED from the count rather than carried: a bag is full
+/// exactly when its count equals `M`, `M` is in the params, and a flag would be
+/// a second encoding of a fact already on the wire. So the test reads it back
+/// through `Summary::parse`, which is where the derivation lives, rather than
+/// off a byte.
 #[test]
 fn a_summary_says_full_only_when_it_is() {
     let p = params(0, 8);
     let pool = many(&p, 20, 2);
     let partial = bag(&p, &pool[..3]);
     let full = bag(&p, &pool);
+    let read = |s: &BagState| Summary::parse(&summarize(s), p.m).expect("our own summary");
 
-    let s = summarize(&partial, p.m);
-    assert_eq!(s[2], 0, "3 of 8 is not full");
-    let s = summarize(&full, p.m);
-    assert_eq!(s[2], 1, "8 of 8 is full");
+    assert_eq!(read(&partial).count, 3);
+    assert!(!read(&partial).full, "3 of 8 is not full");
+    assert_eq!(read(&full).count, p.m);
+    assert!(read(&full).full, "8 of 8 is full");
+    assert!(!read(&BagState::default()).full);
+
     // The lowest kept is the last in rank order, with its FULL name.
-    assert_eq!(&s[4..36], &full.held.last().unwrap().name[..]);
-    assert_eq!(summarize(&BagState::default(), p.m)[2], 0);
+    let s = summarize(&full);
+    assert_eq!(&s[3..35], &full.held.last().unwrap().name[..]);
+    // And the flag really is gone from the wire: the head is three bytes plus
+    // the name, not four.
+    assert_eq!(s.len(), 2 + 1 + 32 + p.m as usize * 16);
 }
 
 /// The bag keeps the top M BY WORK. Ordering by name alone would still be a
@@ -357,4 +369,47 @@ fn ordering_by_work_then_name_is_ordering_by_name() {
         works[0],
         works[works.len() - 1]
     );
+}
+
+/// Every bound `parse` enforces, `join` must enforce on its OUTPUT.
+///
+/// A join that can produce a state the contract refuses is worse than a bug in
+/// the merge: under F23 the host validates its own merge result, refuses it,
+/// and the two replicas never converge. The Set had exactly that (its deny list
+/// was unioned past the cap it parses), so the property is asserted here rather
+/// than assumed — the Bag's cut to `M` is the bound today, and this is what
+/// keeps the next bound honest.
+#[test]
+fn the_join_of_any_two_states_that_parse_parses() {
+    let p = params(0, 4);
+    let pool = many(&p, 24, 3);
+    let parses = |s: &BagState| craftec_bag_contract::read(&p.encode(), &s.encode()).is_some();
+    let mut next = rng(99);
+    let mut states: Vec<BagState> = vec![BagState::default()];
+    for _ in 0..10 {
+        let take: Vec<Pointer> = pool
+            .iter()
+            .filter(|_| next().is_multiple_of(2))
+            .cloned()
+            .collect();
+        states.push(bag(&p, &take));
+    }
+    // Every state is at or over capacity often enough for the cut to be live.
+    assert!(
+        states.iter().any(|s| s.held.len() as u16 == p.m),
+        "no generated bag reached capacity: the cut is untested"
+    );
+    for a in &states {
+        assert!(parses(a), "a generated state does not parse");
+        for b in &states {
+            let j = join(a, b, p.m);
+            assert!(
+                j.held.len() as u16 <= p.m,
+                "the join kept {} of a maximum {}",
+                j.held.len(),
+                p.m
+            );
+            assert!(parses(&j), "the join produced a state the contract refuses");
+        }
+    }
 }

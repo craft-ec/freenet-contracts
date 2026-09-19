@@ -177,13 +177,33 @@ pub struct Held {
 /// Names hashed. A pointer's name costs a BLAKE3 over its payload, and that is
 /// the work a hostile state can impose — counted so a test can assert on it
 /// rather than on a clock.
-#[cfg(test)]
-pub static HASHED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+///
+/// **Thread-local, and that is the whole point of the module.** The harness
+/// runs a binary's tests in parallel threads, so a process-global counter
+/// reports whatever every other test happened to be doing at the moment it was
+/// read. Every cost assertion over one is a race that usually passes, and a
+/// green run looks identical either way. Per-thread, a test sees its own work
+/// and nobody else's.
+#[cfg(any(test, feature = "testing"))]
+pub mod hashed {
+    use core::cell::Cell;
+    thread_local! { static N: Cell<usize> = const { Cell::new(0) }; }
+    /// Names hashed on this thread since the last [`reset`].
+    pub fn count() -> usize {
+        N.with(|n| n.get())
+    }
+    pub fn reset() {
+        N.with(|n| n.set(0));
+    }
+    pub(crate) fn tick() {
+        N.with(|n| n.set(n.get() + 1));
+    }
+}
 
 impl Held {
     pub fn of(ptr: Pointer, ph: &[u8; HASH_LEN]) -> Held {
-        #[cfg(test)]
-        HASHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(any(test, feature = "testing"))]
+        hashed::tick();
         let name = ptr.name(ph);
         Held {
             work: Pointer::work(&name),

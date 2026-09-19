@@ -915,6 +915,57 @@ mod tests {
         }
     }
 
+    /// Every bound `parse` enforces, the merge must enforce on its OUTPUT.
+    ///
+    /// A merge that can produce a state the contract refuses is worse than a
+    /// bug in the merge: under F23 the host validates its own result, refuses
+    /// it, and the two replicas never converge. The Set had exactly that — its
+    /// deny list was unioned past the cap it parses — so the property is
+    /// asserted here rather than assumed, over every pair of a set of states
+    /// that includes the empty register, plain records, a terminal one and a
+    /// forked one.
+    #[test]
+    fn the_merge_of_any_two_states_that_validate_validates() {
+        let w = world();
+        let forked = {
+            let a = w.encode(&w.state(w.record(false, 5, b"one")));
+            let b = w.encode(&w.state(w.record(false, 5, b"two")));
+            update_with(&w.params_bytes, &a, vec![b])
+        };
+        let states: Vec<Vec<u8>> = vec![
+            Vec::new(),
+            w.encode(&w.state(w.record(false, 1, b"first"))),
+            w.encode(&w.state(w.record(false, 9, b"ninth"))),
+            w.encode(&w.state(w.record(false, 9, b"ninth, another value"))),
+            w.encode(&w.state(w.record(true, 12, &[7u8; 32]))),
+            forked.clone(),
+            w.encode(&w.state(w.resigned(false, 9, b"ninth", 5))),
+        ];
+        for s in &states {
+            assert!(
+                valid(&w.params_bytes, s),
+                "a generated state does not validate"
+            );
+        }
+        let mut forks = 0;
+        for a in &states {
+            for b in &states {
+                let out = update_with(&w.params_bytes, a, vec![b.clone()]);
+                assert!(
+                    valid(&w.params_bytes, &out),
+                    "the merge produced a state the contract refuses"
+                );
+                if read(&w.params_bytes, &out).unwrap().1.forked() {
+                    forks += 1;
+                }
+            }
+        }
+        assert!(
+            forks > 0,
+            "no pair produced evidence: the branch that grows the state is untested"
+        );
+    }
+
     fn summary(w: &World, s: &[u8]) -> Vec<u8> {
         Register::summarize_state(
             Parameters::from(w.params_bytes.clone()),

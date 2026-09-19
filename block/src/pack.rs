@@ -42,37 +42,6 @@ pub const MIN_MEMBER: usize = 1 + 4;
 
 const HEADER: usize = 4 + 2;
 
-/// Work a pack can ask a host for, counted so the price of REFUSING one can be
-/// asserted rather than argued. Thread-local: the harness runs tests on many
-/// threads, and a process-global counter reports every thread's work to every
-/// reader.
-#[cfg(any(test, feature = "testing"))]
-pub mod work {
-    use core::cell::Cell;
-    thread_local! {
-        static IDS: Cell<usize> = const { Cell::new(0) };
-        static BODIES: Cell<usize> = const { Cell::new(0) };
-    }
-    /// Member ids hashed on this thread since [`reset`].
-    pub fn ids() -> usize {
-        IDS.with(|n| n.get())
-    }
-    /// Member bodies checked for well-formedness since [`reset`].
-    pub fn bodies() -> usize {
-        BODIES.with(|n| n.get())
-    }
-    pub fn reset() {
-        IDS.with(|n| n.set(0));
-        BODIES.with(|n| n.set(0));
-    }
-    pub(super) fn tick_id() {
-        IDS.with(|n| n.set(n.get() + 1));
-    }
-    pub(super) fn tick_body() {
-        BODIES.with(|n| n.set(n.get() + 1));
-    }
-}
-
 /// May this kind ride in a pack?
 ///
 /// `RAW` and `TREE_NODE` only — no pack in a pack, and nothing whose format has
@@ -137,7 +106,7 @@ pub fn well_formed(body: &[u8]) -> bool {
         // same. The id comes first because it is one hash, where a body check
         // can be a full node parse.
         #[cfg(any(test, feature = "testing"))]
-        work::tick_id();
+        crate::work::tick_id();
         let id = freenet_prolly::block_id(k, bytes);
         // Strictly ascending: no duplicates, and one encoding per set.
         if prev.is_some_and(|p| p >= id) {
@@ -146,7 +115,7 @@ pub fn well_formed(body: &[u8]) -> bool {
         prev = Some(id);
 
         #[cfg(any(test, feature = "testing"))]
-        work::tick_body();
+        crate::work::tick_body();
         // THE SAME check the contract runs on a standalone block. Not a copy of
         // its rules: a call to it.
         if !crate::well_formed(k, bytes) {
@@ -168,10 +137,20 @@ pub fn well_formed(body: &[u8]) -> bool {
 ///
 /// It does not otherwise check the members: `well_formed` decides, and a
 /// builder that refused early would hide the cases the tests exist to reach.
-pub fn build(members: &[(u8, Vec<u8>)]) -> Vec<u8> {
+pub fn build(members: &[(u8, Vec<u8>)]) -> Result<Vec<u8>, BuildError> {
     let mut ordered: Vec<&(u8, Vec<u8>)> = members.iter().collect();
     ordered.sort_by_key(|(k, b)| freenet_prolly::block_id(*k, b));
     ordered.dedup_by_key(|(k, b)| freenet_prolly::block_id(*k, b));
+    if ordered.is_empty() {
+        return Err(BuildError::Empty);
+    }
+    // `count` is a u16 on the wire, so more members than that cannot be
+    // expressed — and casting would have written a small count in front of a
+    // long body, which the contract refuses for a reason the caller could not
+    // see from its own input.
+    if ordered.len() > u16::MAX as usize {
+        return Err(BuildError::TooManyMembers(ordered.len()));
+    }
     let mut out = Vec::from(&MAGIC[..]);
     out.extend_from_slice(&(ordered.len() as u16).to_le_bytes());
     for (k, b) in ordered {
@@ -179,5 +158,27 @@ pub fn build(members: &[(u8, Vec<u8>)]) -> Vec<u8> {
         out.extend_from_slice(&(b.len() as u32).to_le_bytes());
         out.extend_from_slice(b);
     }
-    out
+    // Checked at the end rather than accumulated, because the members are not
+    // known to be within their own kinds' caps either; `well_formed` decides
+    // that, and this only promises that what comes back is a pack the contract
+    // could accept on size.
+    if out.len() > MAX_PACK {
+        return Err(BuildError::TooLarge(out.len()));
+    }
+    Ok(out)
+}
+
+/// Why a set of members cannot be made into a pack.
+///
+/// The engine calls `build`, so the ways it can fail are part of its contract
+/// with the engine rather than something a caller discovers from a refusal
+/// three layers away.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BuildError {
+    /// A pack of nothing is not a pack.
+    Empty,
+    /// More members than the u16 count can express.
+    TooManyMembers(usize),
+    /// The body would exceed [`MAX_PACK`].
+    TooLarge(usize),
 }

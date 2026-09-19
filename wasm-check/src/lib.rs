@@ -509,9 +509,9 @@ static mut PACK_CASES: Vec<PackCase> = Vec::new();
 fn pack_push(members: Vec<(u8, Vec<u8>)>) -> u32 {
     use craftec_block_contract::{encode, kind, pack::build};
     let n = members.len() as u32;
-    let state = encode(kind::PACK, &build(&members));
+    let state = encode(kind::PACK, &build(&members).expect("a buildable pack"));
     let case = PackCase {
-        params: freenet_prolly::block_id(kind::PACK, &build(&members)).to_vec(),
+        params: freenet_prolly::block_id(kind::PACK, &build(&members).expect("a buildable pack")).to_vec(),
         state,
         members: n,
     };

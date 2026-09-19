@@ -142,6 +142,36 @@ mod tests {
             .unwrap_or_default()
     }
 
+    /// The same vectors are frozen in freenet-prolly (`tests/vectors.txt`, `id`
+    /// lines): a tree's child pointers must be exactly these params.
+    #[test]
+    fn block_ids_match_the_tree_library() {
+        fn hex(b: &[u8]) -> String {
+            b.iter().map(|x| format!("{x:02x}")).collect()
+        }
+        for (k, body, want) in [
+            (
+                kind::RAW,
+                &b""[..],
+                "2d3adedff11b61f14c886e35afa036736dcd87a74d27b5c1510225d0f592e213",
+            ),
+            (
+                kind::RAW,
+                b"value",
+                "2585d5bd187a38e8206be259760a812f6746eed27edbad08606d7d52e38a0e74",
+            ),
+            (
+                kind::TREE_NODE,
+                b"value",
+                "89e4038bf5c0681ed10512a02b00493e0473e1e09e7d8914d4cb00c66cfd1507",
+            ),
+        ] {
+            let s = encode(k, body);
+            assert_eq!(hex(blake3::hash(&s).as_bytes()), want);
+            assert_eq!(validate(params_of(&s), s), ValidateResult::Valid);
+        }
+    }
+
     #[test]
     fn a_block_is_valid_only_under_its_own_hash() {
         let s = encode(kind::RAW, b"hello");

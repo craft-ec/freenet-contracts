@@ -1,0 +1,51 @@
+# Contract code hashes that have been RELEASED, by epoch.
+#
+# A contract's wasm hash is part of its network key, so a reader needs this
+# table to know which code to ask under, and a keeper needs it to know what it
+# is still serving. It is the table the epoch procedure of #8 writes to, and
+# the one the SDK and the harness read.
+#
+# NOTHING IN THIS REPOSITORY'S GATES COMPARES A BUILD AGAINST THIS FILE.
+# `hash-gate.sh` asserts properties of the hash and never a constant, precisely
+# so that an ordinary code change goes green and nobody is ever prompted to
+# "update the expected hash" — which is how an epoch gets declared by accident.
+# One pinned number cannot both gate HEAD and name a release; these are the
+# releases.
+#
+# WHO MAY CHANGE THIS FILE, AND WHEN
+#
+# Only the code-upgrade procedure of #8 adds a row, and only when an epoch is
+# actually published: the new code is built from a tag, reviewed, published,
+# and an overlap window is agreed during which the previous epoch keeps being
+# served until its `serves_until`.
+#
+# NEVER because a gate went red. A red gate means the code changed, which is
+# ordinary; `hash-gate.sh` does not read this file and cannot be satisfied by
+# editing it. Anyone who arrives here after a failing build has taken a wrong
+# turn — the hashes a HEAD build produces are a build, not a release, and they
+# belong in the README and the pull request under that name.
+#
+# Editing a row that has ever been published is not an edit, it is a fork: the
+# rows are what readers and keepers resolve keys through, and a changed row
+# silently points them at code nobody is serving.
+#
+# Adding a row means: rebuild from the tag with `./build.sh`, record the full
+# sha256 of each `build/*.wasm`, and name the toolchain — `RUSTC_BOOTSTRAP=1`
+# and `-Zlocation-detail=none` tie the bytes to it, and a toolchain bump is an
+# epoch in its own right.
+
+# EMPTY ON PURPOSE, and it stays empty until phase 3. No epoch has been
+# released and no data is stored under any of these contracts, which is why
+# #16 could change every hash for free. The hashes a HEAD build produces today
+# are in `./build.sh`'s output, in the README and in the pull request that
+# produced them, described there as the current build.
+
+# [[epoch]]
+# number      = 1
+# released    = "YYYY-MM-DD"
+# tag         = "vX.Y.Z"
+# toolchain   = "1.97.1"
+# serves_until = ""              # set when epoch 2 is published
+# [epoch.code]
+# block    = "sha256:…"
+# register = "sha256:…"

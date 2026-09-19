@@ -712,6 +712,15 @@ impl SetState {
                 signer: d[..KEY_LEN].try_into().ok()?,
                 sig: d[KEY_LEN..].try_into().ok()?,
             };
+            // The owner cannot deny ITSELF. Hiding its own tier is never what
+            // an owner means, it is a second way to empty a Set, and — unlike
+            // every other denial — nothing else in the format would stop it:
+            // the owner signs denials, so it can always produce a valid one
+            // naming its own key. Refused here, where a fetched state is the
+            // only thing a host checks.
+            if entry.signer == *p.owner.as_bytes() {
+                return None;
+            }
             // Canonical: strictly increasing by the denied key.
             if let Some(prev) = deny.last() {
                 if prev.signer >= entry.signer {

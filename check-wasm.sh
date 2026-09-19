@@ -1,12 +1,33 @@
 #!/usr/bin/env bash
-# Time the block contract's validation inside wasm32, on the worst case a host
-# can be handed. A missing tool fails; it never skips.
+# Time each contract's validation inside wasm32, on the worst case a host can
+# be handed. A missing tool fails; it never skips.
+#
+# The harness is built with the SAME flags a contract ships with, taken from
+# `contract-build.sh --flags` rather than copied: a timing run over code built
+# differently from the code that runs on the network is a number about nothing.
+# `CHECK_WASM_UNHARDENED=1` builds it without them, which is how the cost of
+# the hardening itself is measured.
 set -euo pipefail
 cd "$(dirname "$0")"
 command -v node >/dev/null || { echo "check-wasm: node is required" >&2; exit 1; }
 rustup target list --installed | grep -qx wasm32-unknown-unknown ||
   { echo "check-wasm: rust target wasm32-unknown-unknown is required" >&2; exit 1; }
+if [ -n "${CHECK_WASM_UNHARDENED:-}" ]; then
+  echo "check-wasm: harness built UNHARDENED — not the code that ships" >&2
+  export RUSTFLAGS=""
+else
+  export RUSTC_BOOTSTRAP=1
+  RUSTFLAGS=$(./contract-build.sh --flags wasm-check); export RUSTFLAGS
+fi
 cargo build --quiet --release --target wasm32-unknown-unknown --manifest-path wasm-check/Cargo.toml
+harness=wasm-check/target/wasm32-unknown-unknown/release/wasm_check.wasm
+# WHICH binary was timed, printed rather than assumed: a timing run over a
+# stale or differently-built artefact reads exactly like a fast one. The size
+# is the observable that separates the two modes — 113,759 B hardened against
+# 118,899 B not, at the time of writing — because this profile sets
+# `strip = true`, so the source paths that distinguish a contract's two builds
+# are gone from the harness either way.
+echo "harness: $(wc -c < "$harness" | tr -d ' ') B sha256=$(shasum -a 256 "$harness" | cut -c1-16)$([ -n "${CHECK_WASM_UNHARDENED:-}" ] && echo ' UNHARDENED' || echo ' (contract flags)')"
 node - <<'JS'
 const fs = require('fs');
 const path = 'wasm-check/target/wasm32-unknown-unknown/release/wasm_check.wasm';

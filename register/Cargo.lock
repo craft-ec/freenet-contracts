@@ -180,15 +180,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "craftec-block-contract"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "freenet-prolly",
- "freenet-stdlib",
-]
-
-[[package]]
 name = "craftec-register-contract"
 version = "0.1.0"
 dependencies = [
@@ -410,14 +401,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
-]
-
-[[package]]
-name = "freenet-prolly"
-version = "0.1.0"
-source = "git+https://github.com/craft-ec/freenet-prolly?rev=3f5bc1a#3f5bc1ada0562bee8d65db829b84db2a31910b09"
-dependencies = [
- "blake3",
 ]
 
 [[package]]
@@ -1203,15 +1186,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "81941cd78d0c92026c33e5e01312845a4cb1e9af3407f9134b100dd03144103e"
 dependencies = [
  "unicode-ident",
-]
-
-[[package]]
-name = "wasm-check"
-version = "0.0.0"
-dependencies = [
- "craftec-block-contract",
- "craftec-register-contract",
- "freenet-prolly",
 ]
 
 [[package]]

@@ -123,3 +123,58 @@ pub extern "C" fn well_formed_n(h: u32, runs: u32) -> u32 {
         })
         .count() as u32
 }
+
+/// One prepared register: the worst case a host can be handed, mode 1 with
+/// `n = 16, k = 16`, so every validation verifies sixteen signatures over a
+/// full-size value, and the state carries evidence as well as a record.
+pub struct Reg {
+    params: Vec<u8>,
+    state: Vec<u8>,
+}
+
+#[no_mangle]
+pub extern "C" fn prepare_register() -> u32 {
+    let (params, state) = craftec_register_contract::testing::worst_case();
+    Box::into_raw(Box::new(Reg { params, state })) as u32
+}
+
+/// # Safety
+/// `h` must be a handle from [`prepare_register`] that has not been freed.
+unsafe fn reg<'a>(h: u32) -> &'a Reg {
+    &*(h as *const Reg)
+}
+
+#[no_mangle]
+pub extern "C" fn register_state_len(h: u32) -> u32 {
+    unsafe { reg(h) }.state.len() as u32
+}
+
+/// Validate the register `runs` times; returns how many passed.
+#[no_mangle]
+pub extern "C" fn register_validate_n(h: u32, runs: u32) -> u32 {
+    let r = unsafe { reg(h) };
+    (0..runs)
+        .filter(|_| {
+            craftec_register_contract::read(
+                std::hint::black_box(&r.params),
+                std::hint::black_box(&r.state),
+            )
+            .is_some()
+        })
+        .count() as u32
+}
+
+/// Correctness inside wasm32: the good state validates and a one-bit change to
+/// it does not. A build where verification silently did nothing would be very
+/// fast and would fail here.
+#[no_mangle]
+pub extern "C" fn register_accepts_good_refuses_corrupt(h: u32) -> u32 {
+    let r = unsafe { reg(h) };
+    let mut bad = r.state.clone();
+    let at = bad.len() - 1; // inside the last signature
+    bad[at] ^= 1;
+    u32::from(
+        craftec_register_contract::read(&r.params, &r.state).is_some()
+            && craftec_register_contract::read(&r.params, &bad).is_none(),
+    )
+}

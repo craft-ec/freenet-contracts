@@ -1,0 +1,472 @@
+//! Encodings, and the checks that make each one canonical.
+//!
+//! Every integer is little-endian. Every structure here has exactly one valid
+//! encoding: a host that accepted two spellings of one logical state would let
+//! the same decision hash two ways, and the merge order (which breaks ties on
+//! hashes) would stop being a function of the decision.
+
+use ed25519_dalek::{Signature, VerifyingKey};
+
+pub const MAGIC: &[u8; 4] = b"RG01";
+/// Domain separator for the signed message. Distinct from [`MAGIC`] so a state
+/// can never be read as a signed message or the reverse.
+pub const SIG_DOMAIN: &[u8; 8] = b"RG01-sig";
+pub const MAX_LABEL: usize = 64;
+pub const MAX_VALUE: usize = 4096;
+pub const MAX_N: usize = 16;
+pub const KEY_LEN: usize = 32;
+pub const SIG_LEN: usize = 64;
+pub const HASH_LEN: usize = 32;
+/// `terminal(1) ‖ seq(8) ‖ BLAKE3(value)(32)`, the part of a record that is
+/// signed and that evidence carries in place of the value.
+const SIGNED_FIELDS: usize = 1 + 8 + HASH_LEN;
+
+/// Field modulus p = 2²⁵⁵ − 19, little-endian. A public key's y coordinate must
+/// be below it, or the same point has more than one encoding.
+const P_LE: [u8; 32] = [
+    0xed, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f,
+];
+
+/// Is this the canonical encoding of a point, i.e. is y < p? `VerifyingKey`
+/// accepts a handful of y ≥ p encodings, which decompress to points that also
+/// have a canonical spelling — two names for one signer.
+fn key_is_canonical(b: &[u8; KEY_LEN]) -> bool {
+    let mut y = *b;
+    y[31] &= 0x7f; // the top bit is the x sign, not part of y
+    for i in (0..KEY_LEN).rev() {
+        if y[i] != P_LE[i] {
+            return y[i] < P_LE[i];
+        }
+    }
+    false // y == p
+}
+
+/// A key the contract will accept: canonically encoded, on the curve, and not
+/// small-order (a small-order key verifies some signatures under every message).
+fn usable_key(b: &[u8]) -> Option<VerifyingKey> {
+    let b: [u8; KEY_LEN] = b.try_into().ok()?;
+    if !key_is_canonical(&b) {
+        return None;
+    }
+    let k = VerifyingKey::from_bytes(&b).ok()?;
+    (!k.is_weak()).then_some(k)
+}
+
+/// Who may write this register. Fixed for the register's whole life: changing it
+/// means moving the head (ARCHITECTURE.md §3), which is what terminal records
+/// are for.
+#[derive(Clone, Debug)]
+pub enum Authority {
+    /// mode 0 — one key.
+    One(VerifyingKey),
+    /// mode 1 — `k` of `n`, keys strictly sorted.
+    Quorum { k: usize, keys: Vec<VerifyingKey> },
+}
+
+impl Authority {
+    /// How many signatures a valid record carries. Exactly this many: fewer is
+    /// under threshold, more is a second encoding of the same decision.
+    pub fn sigs_required(&self) -> usize {
+        match self {
+            Authority::One(_) => 1,
+            Authority::Quorum { k, .. } => *k,
+        }
+    }
+    /// Bytes of the signer bitmap in an encoding: none in mode 0, where there is
+    /// nothing to choose.
+    fn bitmap_len(&self) -> usize {
+        match self {
+            Authority::One(_) => 0,
+            Authority::Quorum { .. } => 2,
+        }
+    }
+}
+
+/// `"RG01" ‖ mode(1) ‖ authority ‖ label`. The authority lives in the params, so
+/// the contract key commits to it and a host needs nothing else to check a
+/// signature.
+#[derive(Clone, Debug)]
+pub struct Params {
+    pub authority: Authority,
+    pub label: Vec<u8>,
+    /// BLAKE3 of the parameter bytes, which every signature is bound to.
+    pub hash: [u8; HASH_LEN],
+}
+
+impl Params {
+    pub fn parse(b: &[u8]) -> Option<Params> {
+        let rest = b.strip_prefix(MAGIC)?;
+        let (mode, rest) = rest.split_first()?;
+        let (authority, rest) = match mode {
+            0 => {
+                let (k, rest) = rest.split_at_checked(KEY_LEN)?;
+                (Authority::One(usable_key(k)?), rest)
+            }
+            1 => {
+                let (&k, rest) = rest.split_first()?;
+                let (&n, rest) = rest.split_first()?;
+                let (k, n) = (k as usize, n as usize);
+                if k == 0 || n == 0 || k > n || n > MAX_N {
+                    return None;
+                }
+                let (raw, rest) = rest.split_at_checked(n * KEY_LEN)?;
+                let mut keys = Vec::with_capacity(n);
+                for (i, chunk) in raw.chunks_exact(KEY_LEN).enumerate() {
+                    // Strictly sorted: an order to index the bitmap by, and no
+                    // key twice (which would let one signer fill two slots).
+                    if i > 0 && chunk <= &raw[(i - 1) * KEY_LEN..i * KEY_LEN] {
+                        return None;
+                    }
+                    keys.push(usable_key(chunk)?);
+                }
+                (Authority::Quorum { k, keys }, rest)
+            }
+            _ => return None,
+        };
+        if rest.len() > MAX_LABEL {
+            return None;
+        }
+        Some(Params {
+            authority,
+            label: rest.to_vec(),
+            hash: *blake3::hash(b).as_bytes(),
+        })
+    }
+
+    /// The bytes a signer signs. Bound to the params — not to the contract code —
+    /// so that after a code upgrade anyone can re-publish the latest record under
+    /// the new code and have it verify. Max-merge makes the old records harmless.
+    pub fn signed_message(&self, terminal: bool, seq: u64, value_hash: &[u8; HASH_LEN]) -> Vec<u8> {
+        let mut m = Vec::with_capacity(SIG_DOMAIN.len() + HASH_LEN + SIGNED_FIELDS);
+        m.extend_from_slice(SIG_DOMAIN);
+        m.extend_from_slice(&self.hash);
+        m.push(u8::from(terminal));
+        m.extend_from_slice(&seq.to_le_bytes());
+        m.extend_from_slice(value_hash);
+        m
+    }
+}
+
+/// The signed part of a record: what a signature covers, and exactly what
+/// evidence of equivocation needs. It carries the value's hash, never the value,
+/// so equivocation can be proved to someone who holds neither version.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Signed {
+    pub terminal: bool,
+    pub seq: u64,
+    pub value_hash: [u8; HASH_LEN],
+    /// Which of the `n` keys signed, bit `i` for key `i`. Always 0 in mode 0.
+    pub bitmap: u16,
+    /// Exactly `k` signatures, ordered by the key index they belong to.
+    pub sigs: Vec<[u8; SIG_LEN]>,
+}
+
+impl Signed {
+    fn encoded_len(a: &Authority) -> usize {
+        SIGNED_FIELDS + a.bitmap_len() + a.sigs_required() * SIG_LEN
+    }
+
+    fn write_head(&self, out: &mut Vec<u8>) {
+        out.push(u8::from(self.terminal));
+        out.extend_from_slice(&self.seq.to_le_bytes());
+    }
+
+    fn write_sigs(&self, out: &mut Vec<u8>, a: &Authority) {
+        if a.bitmap_len() != 0 {
+            out.extend_from_slice(&self.bitmap.to_le_bytes());
+        }
+        for s in &self.sigs {
+            out.extend_from_slice(s);
+        }
+    }
+
+    pub fn encode(&self, a: &Authority) -> Vec<u8> {
+        let mut out = Vec::with_capacity(Self::encoded_len(a));
+        self.write_head(&mut out);
+        out.extend_from_slice(&self.value_hash);
+        self.write_sigs(&mut out, a);
+        out
+    }
+
+    /// Read the signature block — bitmap and signatures — and refuse every
+    /// non-canonical shape: a count that disagrees with the bitmap, a bit for a
+    /// key that does not exist, and in mode 1 a popcount that is not exactly k.
+    fn parse_sigs(b: &[u8], a: &Authority) -> Option<(u16, Vec<[u8; SIG_LEN]>)> {
+        let (bitmap, rest) = match a {
+            Authority::One(_) => (0u16, b),
+            Authority::Quorum { k, keys } => {
+                let (raw, rest) = b.split_at_checked(2)?;
+                let bitmap = u16::from_le_bytes([raw[0], raw[1]]);
+                // Exactly k signers, and no bit outside the keyset. The mask is
+                // built by shifting DOWN: `1 << n` overflows a u16 at n = 16,
+                // which is a legal keyset size.
+                let allowed = u16::MAX >> (u16::BITS as usize - keys.len());
+                if bitmap.count_ones() as usize != *k || bitmap & !allowed != 0 {
+                    return None;
+                }
+                (bitmap, rest)
+            }
+        };
+        let want = a.sigs_required();
+        if rest.len() != want * SIG_LEN {
+            return None;
+        }
+        let sigs = rest
+            .chunks_exact(SIG_LEN)
+            .map(|c| c.try_into().expect("chunk is SIG_LEN"))
+            .collect();
+        Some((bitmap, sigs))
+    }
+
+    fn parse(b: &[u8], a: &Authority) -> Option<Signed> {
+        if b.len() != Self::encoded_len(a) {
+            return None;
+        }
+        let (&terminal, rest) = b.split_first()?;
+        let (seq, rest) = rest.split_at_checked(8)?;
+        let (value_hash, rest) = rest.split_at_checked(HASH_LEN)?;
+        let (bitmap, sigs) = Self::parse_sigs(rest, a)?;
+        Some(Signed {
+            terminal: canonical_bool(terminal)?,
+            seq: u64::from_le_bytes(seq.try_into().ok()?),
+            value_hash: value_hash.try_into().ok()?,
+            bitmap,
+            sigs,
+        })
+    }
+
+    /// Do the required signatures verify, under the flagged keys, in order?
+    ///
+    /// `verify_strict` is deliberate: it rejects a signature whose scalar S is
+    /// not fully reduced (so `S` and `S + L` are not both accepted for one
+    /// message) and rejects small-order `R` and `A`.
+    pub fn verify(&self, p: &Params) -> bool {
+        let msg = p.signed_message(self.terminal, self.seq, &self.value_hash);
+        let keys: Vec<&VerifyingKey> = match &p.authority {
+            Authority::One(k) => vec![k],
+            Authority::Quorum { keys, .. } => (0..keys.len())
+                .filter(|i| self.bitmap & (1 << i) != 0)
+                .map(|i| &keys[i])
+                .collect(),
+        };
+        if keys.len() != self.sigs.len() {
+            return false;
+        }
+        // Each signature is checked against its own signer, so a signature out of
+        // key order fails, and one signer cannot fill two slots.
+        keys.iter()
+            .zip(&self.sigs)
+            .all(|(k, s)| k.verify_strict(&msg, &Signature::from_bytes(s)).is_ok())
+    }
+}
+
+fn canonical_bool(b: u8) -> Option<bool> {
+    match b {
+        0 => Some(false),
+        1 => Some(true),
+        _ => None, // any other byte is a second spelling of true
+    }
+}
+
+/// A record: the signed decision together with the value it decides on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Record {
+    pub signed: Signed,
+    pub value: Vec<u8>,
+}
+
+impl Record {
+    pub fn new(signed: Signed, value: Vec<u8>) -> Option<Record> {
+        // The hash in the signed part is what a signature commits to, so a record
+        // whose value does not match it is not a record of that decision.
+        (value.len() <= MAX_VALUE && *blake3::hash(&value).as_bytes() == signed.value_hash)
+            .then_some(Record { signed, value })
+    }
+
+    pub fn encode(&self, a: &Authority) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.signed.write_head(&mut out);
+        // `as u16` would silently wrap a value longer than 64 KiB and write a
+        // length that disagrees with the bytes after it — a short read of a long
+        // value. Saturating instead keeps the encoding unparseable (the length
+        // is over MAX_VALUE either way), so an over-cap record is refused rather
+        // than quietly truncated. Records from `parse` and `new` are already
+        // within the cap; this makes that impossible to bypass, not just
+        // unlikely.
+        let vlen = u16::try_from(self.value.len()).unwrap_or(u16::MAX);
+        out.extend_from_slice(&vlen.to_le_bytes());
+        out.extend_from_slice(&self.value);
+        self.signed.write_sigs(&mut out, a);
+        out
+    }
+
+    /// Returns the record and the bytes left over, since a state may hold
+    /// evidence after it.
+    fn parse(b: &[u8], a: &Authority) -> Option<(Record, usize)> {
+        let (&terminal, rest) = b.split_first()?;
+        let (seq, rest) = rest.split_at_checked(8)?;
+        let (vlen, rest) = rest.split_at_checked(2)?;
+        let vlen = u16::from_le_bytes([vlen[0], vlen[1]]) as usize;
+        if vlen > MAX_VALUE {
+            return None;
+        }
+        let (value, rest) = rest.split_at_checked(vlen)?;
+        let sig_len = a.bitmap_len() + a.sigs_required() * SIG_LEN;
+        let (sig_block, _) = rest.split_at_checked(sig_len)?;
+        let (bitmap, sigs) = Signed::parse_sigs(sig_block, a)?;
+        let signed = Signed {
+            terminal: canonical_bool(terminal)?,
+            seq: u64::from_le_bytes(seq.try_into().ok()?),
+            value_hash: *blake3::hash(value).as_bytes(),
+            bitmap,
+            sigs,
+        };
+        let used = 1 + 8 + 2 + vlen + sig_len;
+        Some((
+            Record {
+                signed,
+                value: value.to_vec(),
+            },
+            used,
+        ))
+    }
+
+    pub fn verify(&self, p: &Params) -> bool {
+        self.signed.verify(p)
+    }
+}
+
+/// Two conflicting signed decisions. Permanent, and provable without either
+/// value: the pair is ordered so one fork has one encoding.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Evidence {
+    pub a: Signed,
+    pub b: Signed,
+}
+
+impl Evidence {
+    /// The pair, lower side first, if these two really do equivocate.
+    pub fn new(x: &Signed, y: &Signed, auth: &Authority) -> Option<Evidence> {
+        if !conflicts(x, y) {
+            return None;
+        }
+        let (a, b) = if x.encode(auth) <= y.encode(auth) {
+            (x.clone(), y.clone())
+        } else {
+            (y.clone(), x.clone())
+        };
+        Some(Evidence { a, b })
+    }
+
+    pub fn encode(&self, a: &Authority) -> Vec<u8> {
+        let mut out = self.a.encode(a);
+        out.extend_from_slice(&self.b.encode(a));
+        out
+    }
+
+    fn parse(b: &[u8], a: &Authority) -> Option<Evidence> {
+        let side = Signed::encoded_len(a);
+        let (x, y) = b.split_at_checked(side)?;
+        let e = Evidence {
+            a: Signed::parse(x, a)?,
+            b: Signed::parse(y, a)?,
+        };
+        // Canonical order, and it must actually be a conflict.
+        (e.a.encode(a) <= e.b.encode(a) && conflicts(&e.a, &e.b)).then_some(e)
+    }
+
+    pub fn verify(&self, p: &Params) -> bool {
+        self.a.verify(p) && self.b.verify(p)
+    }
+}
+
+/// Do these two signed decisions equivocate? Equal `seq` with different values,
+/// or two terminals with different values whatever their `seq` — a writer only
+/// gets to end the register once.
+///
+/// Defined on the VALUE (via its hash), never on the encoding: the same
+/// `(seq, value)` signed by two different subsets of a keyset is one decision
+/// spelled twice, not a fork.
+pub fn conflicts(x: &Signed, y: &Signed) -> bool {
+    x.value_hash != y.value_hash && (x.seq == y.seq || (x.terminal && y.terminal))
+}
+
+/// `"RG01" ‖ flags(1) ‖ record? ‖ evidence?`.
+///
+/// The empty register is the empty byte string, never `MAGIC ‖ 0` — otherwise
+/// "nothing here" would have two encodings.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RegState {
+    pub record: Option<Record>,
+    pub evidence: Option<Evidence>,
+}
+
+const FLAG_RECORD: u8 = 0b01;
+const FLAG_EVIDENCE: u8 = 0b10;
+
+impl RegState {
+    pub fn is_empty(&self) -> bool {
+        self.record.is_none() && self.evidence.is_none()
+    }
+
+    /// A fork is proved exactly when evidence is held.
+    pub fn forked(&self) -> bool {
+        self.evidence.is_some()
+    }
+
+    pub fn encode(&self, a: &Authority) -> Vec<u8> {
+        if self.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::from(*MAGIC);
+        out.push(
+            u8::from(self.record.is_some()) * FLAG_RECORD
+                + u8::from(self.evidence.is_some()) * FLAG_EVIDENCE,
+        );
+        if let Some(r) = &self.record {
+            out.extend_from_slice(&r.encode(a));
+        }
+        if let Some(e) = &self.evidence {
+            out.extend_from_slice(&e.encode(a));
+        }
+        out
+    }
+
+    /// Parse and verify in one step: a state is only ever handled if every
+    /// signature in it holds, so nothing downstream has to remember to check.
+    pub fn parse(b: &[u8], p: &Params) -> Option<RegState> {
+        if b.is_empty() {
+            return Some(RegState::default());
+        }
+        let rest = b.strip_prefix(MAGIC)?;
+        let (&flags, rest) = rest.split_first()?;
+        // 0 would be a second spelling of the empty state; unknown bits are a
+        // format nobody here can check.
+        if flags == 0 || flags & !(FLAG_RECORD | FLAG_EVIDENCE) != 0 {
+            return None;
+        }
+        let mut state = RegState::default();
+        let mut rest = rest;
+        if flags & FLAG_RECORD != 0 {
+            let (r, used) = Record::parse(rest, &p.authority)?;
+            if !r.verify(p) {
+                return None;
+            }
+            state.record = Some(r);
+            rest = &rest[used..];
+        }
+        if flags & FLAG_EVIDENCE != 0 {
+            // Both sides are fixed-size, so this consumes exactly what is left
+            // or fails — which is also what rejects trailing bytes.
+            let e = Evidence::parse(rest, &p.authority)?;
+            if !e.verify(p) {
+                return None;
+            }
+            state.evidence = Some(e);
+        } else if !rest.is_empty() {
+            return None;
+        }
+        Some(state)
+    }
+}

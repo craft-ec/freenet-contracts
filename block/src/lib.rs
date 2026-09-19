@@ -308,6 +308,27 @@ mod tests {
         found.expect("a positionally cut node that breaks the split rule")
     }
 
+    /// A branch carrying parity cids. It is well-formed — parity is part of the
+    /// format — and refused, because nothing emits it yet and it is the one
+    /// region of a valid node no rule constrains (freenet-prolly#19 relaxes this
+    /// when the rule exists).
+    fn node_with_parity() -> Vec<u8> {
+        let leaf = leaf_node();
+        let agg = Node::parse(&leaf).unwrap().agg();
+        let mut b = NodeBuilder::branch(1);
+        b.push_child(
+            b"k/aaa",
+            freenet_prolly::block_id(kind::TREE_NODE, &leaf),
+            agg,
+        )
+        .unwrap();
+        b.push_child(b"k/zzz", [9u8; 32], Agg { count: 1, bytes: 8 })
+            .unwrap();
+        b.push_parity([0x11u8; 32]).unwrap();
+        b.push_parity([0x22u8; 32]).unwrap();
+        b.finish().unwrap()
+    }
+
     /// The worst case a host can be handed: a leaf filled to the 12 KiB measure
     /// with the smallest entries the format allows, so the per-entry pass runs
     /// as many times as it ever can. Keys are chosen so the rule never fires.
@@ -504,6 +525,33 @@ mod tests {
     /// A node can be well-formed and still not be a node this tree could have
     /// produced. One cut in the wrong place is refused, and the entries are
     /// intact — so the refusal is about the boundary, nothing else.
+    /// Parity is well-formed and refused, and the same node without it is kept —
+    /// so the refusal is about the parity, not about the node.
+    #[test]
+    fn a_node_carrying_parity_is_refused() {
+        let with_parity = node_with_parity();
+        let node = Node::parse(&with_parity).expect("parity is part of the format");
+        assert_eq!(node.parity_count(), 2);
+        assert_eq!(
+            check_node(&node),
+            Err(BoundaryError::UnexpectedParity),
+            "the tree library must refuse it"
+        );
+        let s = encode(kind::TREE_NODE, &with_parity);
+        assert_eq!(validate(params_of(&s), s), ValidateResult::Invalid);
+
+        // Control: the same branch with no parity is held.
+        let clean = branch_node();
+        assert_eq!(Node::parse(&clean).unwrap().parity_count(), 0);
+        let s = encode(kind::TREE_NODE, &clean);
+        assert_eq!(validate(params_of(&s), s), ValidateResult::Valid);
+
+        // And the bytes are kept under a kind with no format yet, so the
+        // refusal comes from the kind check.
+        let s = encode(kind::RAW, &with_parity);
+        assert_eq!(validate(params_of(&s), s), ValidateResult::Valid);
+    }
+
     #[test]
     fn a_well_formed_but_mis_cut_node_is_refused() {
         let body = miscut_node();
@@ -525,7 +573,10 @@ mod tests {
         let bodies = malformed_nodes()
             .into_iter()
             .map(|(what, body, _)| (what, body))
-            .chain([("mis-cut but well-formed", miscut_node())]);
+            .chain([
+                ("mis-cut but well-formed", miscut_node()),
+                ("well-formed but carrying parity", node_with_parity()),
+            ]);
         for (what, body) in bodies {
             let s = encode(kind::RAW, &body);
             assert_eq!(validate(params_of(&s), s), ValidateResult::Valid, "{what}");
@@ -567,9 +618,9 @@ mod tests {
             malformed_nodes()
                 .into_iter()
                 .map(|(_, body, _)| body)
-                // The dangerous one: a body that parses, so only the boundary
-                // check stands between it and the store.
-                .chain([miscut_node()])
+                // The dangerous ones: bodies that parse, so only the boundary
+                // check stands between them and the store.
+                .chain([miscut_node(), node_with_parity()])
                 .map(|body| encode(kind::TREE_NODE, &body)),
         );
         assert_eq!(

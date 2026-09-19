@@ -18,7 +18,7 @@ blake3 = { version = "1", default-features = false }
 # Pinned by revision, not by path: the wasm must build byte-identically for
 # anyone who checks this repo out. Bump the rev deliberately — it changes the
 # bytes a tree-node Block is allowed to hold, hence the contract's own hash.
-freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "3f5bc1a" }
+freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "ebbc34f" }
 
 [features]
 default = ["freenet-main-contract"]

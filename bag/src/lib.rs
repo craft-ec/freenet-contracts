@@ -22,6 +22,15 @@
 //! owner's tree, where they are signed; a DENY needs a signature and belongs to
 //! the Set, not here.
 //!
+//! # The name binds the PARAMS — never the key, never the code
+//!
+//! A contract's key moves when its code is upgraded, and anyone must be able to
+//! re-publish an entry under the new code. So the work preimage contains the
+//! params and nothing derived from the key or the wasm: mining for a bag needs
+//! no knowledge of which build is hosting it, and an upgrade invalidates no
+//! pointer anyone paid for. Validation takes the params and the bytes, so two
+//! hosts on different builds cannot disagree about a bag.
+//!
 //! # Why work, and why the name binds the params
 //!
 //! A name is `BLAKE3(domain ‖ params hash ‖ len ‖ payload ‖ nonce)` and must

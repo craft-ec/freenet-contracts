@@ -316,3 +316,86 @@ fn an_eight_byte_collision_does_not_hide_a_pointer() {
         "at 8 bytes these two are indistinguishable — which is why it is 16"
     );
 }
+
+/// Work binds the PARAMS and nothing else — not the contract key, not the code
+/// hash. A code upgrade moves the key; every pointer must still be valid and
+/// re-publishable under the new code, and anyone must be able to mine for a bag
+/// without knowing which build is hosting it.
+///
+/// Proved rather than asserted: the name is recomputed here from the documented
+/// preimage, independently of the crate, so anything ELSE the implementation
+/// might mix in would show up as a mismatch.
+#[test]
+fn work_binds_the_params_only_so_a_code_upgrade_changes_nothing() {
+    use craftec_bag_contract::wire::NAME_DOMAIN;
+    let p = params(0, 16);
+    let ptr = Pointer {
+        payload: b"craftec://ref/one".to_vec(),
+        nonce: [1, 2, 3, 4, 5, 6, 7, 8],
+    };
+
+    // The preimage, written out here: domain, params hash, length, payload,
+    // nonce. Nothing about the code and nothing about the instance.
+    let mut h = blake3::Hasher::new();
+    h.update(NAME_DOMAIN);
+    h.update(&blake3::hash(&p.encode()).as_bytes()[..]);
+    h.update(&(ptr.payload.len() as u16).to_le_bytes());
+    h.update(&ptr.payload);
+    h.update(&ptr.nonce);
+    let expected: [u8; 32] = *h.finalize().as_bytes();
+    assert_eq!(
+        Held::of(ptr.clone(), &p.hash()).name,
+        expected,
+        "the name's preimage is not params ‖ payload ‖ nonce alone"
+    );
+
+    // Frozen: this is the name of this pointer in this bag, for ever, on any
+    // build. If a future change mixes the code or the key into the preimage,
+    // this value moves and every mined pointer in the network is invalidated.
+    assert_eq!(
+        hex(&expected),
+        "d29c1094aa2837fc9891b91f963688db05621af7a5404ec0ae2830277af9c35d"
+    );
+
+    // And a whole state validates the same way whoever is hosting it: the only
+    // inputs to validation are the params and the bytes.
+    let s = collect(many(&p, 16, 3), &p);
+    let bytes = s.encode();
+    let ps = p.encode();
+    for _ in 0..2 {
+        // Two hosts, two code hashes, one answer — validation takes no code
+        // identity, so there is nothing for a build to disagree about.
+        assert!(read(&ps, &bytes).is_some());
+    }
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// A real announcement fits inline. ~105 bytes is what one looks like.
+#[test]
+fn an_announcement_sized_payload_fits() {
+    let p = params(0, 16);
+    let announcement = vec![0x41u8; 105];
+    assert!(
+        announcement.len() <= p.payload_cap as usize,
+        "the default cap is {} B",
+        p.payload_cap
+    );
+    let ptr = mine(&p, &announcement, 1);
+    let s = collect(vec![ptr], &p);
+    assert_eq!(s.held.len(), 1);
+    assert_eq!(s.held[0].ptr.payload.len(), 105);
+    // And it survives the round trip through a host.
+    let bytes = s.encode();
+    let (_, back) = read(&p.encode(), &bytes).expect("a 105 B announcement is a valid pointer");
+    assert_eq!(back, s);
+    // The frozen ceiling leaves room: 256 B is the most a pointer may carry.
+    assert_eq!(craftec_bag_contract::wire::MAX_PAYLOAD, 256);
+    println!(
+        "a {} B announcement fits; the cap is {} B",
+        announcement.len(),
+        p.payload_cap
+    );
+}

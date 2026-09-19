@@ -334,6 +334,9 @@ impl Decision {
     /// one writer's own versions of its own slot and nothing else. A writer
     /// that lies about its own `ts` reorders only itself.
     ///
+    /// Sealing is ONE-WAY: no decision this order can express unseals a slot,
+    /// because a sealed decision outranks every unsealed one whatever its `ts`.
+    ///
     /// `sealed` leads because it has to MEAN something. A flag that is parsed,
     /// signed and hashed but decides nothing is a claim the contract invites a
     /// reader to rely on and never enforces. Sealed means exactly this: **no
@@ -346,8 +349,24 @@ impl Decision {
     /// A tombstone is an ordinary decision here, so deleting a sealed slot
     /// takes a sealed tombstone. That follows from sealing meaning anything at
     /// all, and it is the writer's own slot either way.
-    pub fn rank(&self) -> (bool, u64, core::cmp::Reverse<[u8; HASH_LEN]>) {
-        (self.sealed, self.ts, core::cmp::Reverse(self.payload_hash))
+    /// **Total on decisions**, which the laws depend on: every field of a
+    /// `Decision` appears here, so equal rank means equal decision. It did not
+    /// always — `tombstone` was missing, and since a tombstone carries an empty
+    /// payload and a live item may carry one too, a delete and a live-empty
+    /// item at one `ts` had equal rank and different meanings. The incumbent
+    /// wins a tie, so the two orders of one merge disagreed about whether the
+    /// slot was deleted, for ever, with summaries that differed and therefore
+    /// re-sent on every exchange without either side changing.
+    ///
+    /// A delete beats a live item at the same `ts`: a slot deleted stays
+    /// deleted, which is the same reason a tombstone keeps its slot.
+    pub fn rank(&self) -> (bool, u64, bool, core::cmp::Reverse<[u8; HASH_LEN]>) {
+        (
+            self.sealed,
+            self.ts,
+            self.tombstone,
+            core::cmp::Reverse(self.payload_hash),
+        )
     }
 
     /// What the summary carries, and what the stamp is bought for.

@@ -17,7 +17,9 @@
 //! every host rewrite and every subscriber wake, for free, for ever.
 //! `SetState::decisions` is the projection the law tests compare.
 
-use crate::wire::{Decision, Deny, Held, Params, SetState, Tier, HASH_LEN, KEY_LEN, TRUNC};
+use crate::wire::{
+    Decision, Deny, Held, Params, SetState, Tier, HASH_LEN, KEY_LEN, MAX_DENY, TRUNC,
+};
 
 /// Truncations copied out of a summary. A summary arrives from a stranger and
 /// is sorted here, so its length is work it can impose on every host — counted
@@ -41,9 +43,16 @@ pub mod summary_entries {
 /// Keep the best `quota` slots of each signer and the best `M` of each tier.
 ///
 /// One pass rather than two, and that is not a shortcut: a tier is a property
-/// of the SIGNER, so every slot of one signer is in one tier, and "top quota
-/// per signer, then top M per tier" and "in rank order, keep while both have
-/// room" select the same slots. Pinned by a test.
+/// of the SIGNER (`Held::of` reads `signer == owner`), so every slot of one
+/// signer is in one tier. Walking in rank order, a slot of signer S is skipped
+/// either for S's quota or because S's tier is already full — and once a tier
+/// is full it stays full, so every later slot of S is skipped too. Among KEPT
+/// slots, S's counter therefore equals the slot's rank within S, which is
+/// exactly what the two-pass filter keeps. Pinned by a test.
+///
+/// **If a tier ever becomes a property of the ITEM** rather than the signer —
+/// derived from which witness is attached, say — this equality breaks and the
+/// one pass must become two.
 ///
 /// **The cut is deliberately blind to denials** — see [`join`].
 pub fn cut(mut slots: Vec<Held>, p: &Params) -> Vec<Held> {
@@ -102,17 +111,30 @@ pub fn cut(mut slots: Vec<Held>, p: &Params) -> Vec<Held> {
 /// is [`SetState::visible`].
 ///
 /// This also settles what happens to a denied signer's LATER items: they are
-/// admitted, retained and hidden, exactly like its earlier ones, and they count
-/// in the cut. Refusing them at admission would make a slot's existence depend
+/// admitted, retained and hidden, exactly like its earlier ones — including
+/// after it was denied — and they count in the cut. Refusing them at admission would make a slot's existence depend
 /// on whether the denial had arrived yet, which is the same order-dependence by
 /// another route. A denied signer can therefore hold its `quota` of places in
 /// the cap-holder tier for the life of the bucket, and no more.
 pub fn join(a: &SetState, b: &SetState, p: &Params) -> SetState {
+    // EVERY BOUND `parse` ENFORCES, THE JOIN MUST ENFORCE ON ITS OUTPUT.
+    //
+    // `parse` refuses more than `MAX_DENY` denials. Unioning without a cut, two
+    // states that each parse could merge into one that does not — and under F23
+    // the host validates its own merge result, refuses it, and the replicas
+    // never converge. One honest owner denying from two devices that were apart
+    // is enough. Keeping the LOWEST `MAX_DENY` keys is a join for the same
+    // reason the slot cut is: top-k under a fixed total order.
+    //
+    // The consequence, stated rather than hidden: past `MAX_DENY` denials in a
+    // bucket, the highest denied keys stop being denied. That is the owner's
+    // own ceiling, and a bucket needing more than 64 denials wants re-seeding.
     let mut deny: Vec<Deny> = Vec::with_capacity(a.deny.len() + b.deny.len());
     deny.extend(a.deny.iter().cloned());
     deny.extend(b.deny.iter().cloned());
     deny.sort_by_key(|d| d.signer);
     deny.dedup_by(|x, y| x.signer == y.signer);
+    deny.truncate(MAX_DENY as usize);
 
     // One entry per slot, holding the best decision offered for it.
     let mut slots: Vec<Held> = Vec::with_capacity(a.held.len() + b.held.len());

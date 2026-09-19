@@ -7,7 +7,9 @@
 
 use craftec_set_contract::merge::{cut, join};
 use craftec_set_contract::testing::{world, world_with};
-use craftec_set_contract::wire::{leading_zeros, Admission, Held, Item, Params, SetState, Tier};
+use craftec_set_contract::wire::{
+    leading_zeros, Admission, Held, Item, Params, SetState, Tier, MAX_DENY, MAX_ITEM_KEY,
+};
 
 fn facts(s: &SetState) -> impl PartialEq + core::fmt::Debug {
     s.decisions()
@@ -525,46 +527,84 @@ fn denials_union_and_survive_re_signing() {
     assert_eq!(again.decisions(), both.decisions());
 }
 
-/// The laws over GENERATED states, denials included — because a hand-picked
-/// triple is how two people in a row missed a case.
+/// The laws over GENERATED states — because a hand-picked triple is how three
+/// people in a row missed a case on this contract.
 ///
-/// Twelve states built from a shared pool of overlapping slots, competing
-/// versions, tombstones, seals and two denials, at a capacity small enough that
-/// the cut is live in nearly every merge: 1,728 triples, each checked for
-/// associativity, and every pair for commutativity.
+/// The pool is drawn from the BOUNDARIES the parser enforces, not from
+/// comfortable middles: a payload at the cap and an empty one, a live-empty
+/// item beside a tombstone at the same `ts` (D2 lived exactly there), equal
+/// timestamps competing on payload hash, a sealed item and a sealed tombstone,
+/// an item key at its maximum length, and deny lists whose union overflows
+/// `MAX_DENY` (D1 lived exactly there). Capacity is small enough that the cut
+/// is live in nearly every merge.
+///
+/// Every result is also PARSED: a bound the parser enforces that the join does
+/// not enforce on its output lets the contract manufacture a state it refuses,
+/// and under F23 that is a pair of replicas which never converge.
 #[test]
 fn the_laws_hold_over_every_triple_of_twelve_generated_states() {
-    let w = world_with(11, 4, Admission::Cap, 2, 2, 0);
+    let keys = MAX_DENY as usize + 20;
+    let w = world_with(11, keys, Admission::Cap, 2, 2, 0);
+    let cap = w.params.payload_cap as usize;
     let pool: Vec<Item> = vec![
         w.item(0, b"a", 3, b"a3"),
-        w.item(0, b"a", 7, b"a7"),
-        w.item(1, b"b", 2, b"b2"),
+        w.item(0, b"a", 7, &vec![0xab; cap]), // payload exactly at the cap
+        w.item(1, b"b", 2, b""),              // live, empty payload
+        w.tombstone(1, b"b", 2),              // same ts, same empty payload
         w.tombstone(1, b"b", 5),
         w.sealed(1, b"c", 4, b"c4"),
         w.item(1, b"c", 900, b"late edit of a sealed slot"),
-        w.item(2, b"d", 1, b"d1"),
-        w.item(2, b"e", 6, b"e6"),
+        w.item_full(1, b"c", 901, b"", true, true, 0), // sealed tombstone
+        w.item(2, b"d", 6, b"d-one"),
+        w.item(2, b"d", 6, b"d-two"), // equal ts, decided on hash
+        w.item(
+            2,
+            &[b'e'; MAX_ITEM_KEY],
+            1,
+            b"longest key the format allows",
+        ),
         w.item(3, b"f", 8, b"f8"),
     ];
-    let denials = [w.deny_of(1), w.deny_of(2)];
-    let mut states: Vec<SetState> = Vec::new();
-    states.push(SetState::default());
-    for i in 0..pool.len() {
-        // Overlapping windows, so states share slots rather than partition them.
+    // Two big disjoint blocks of denials: any two of them overflow the cap.
+    let block = |from: usize| -> Vec<_> {
+        (from..from + MAX_DENY as usize / 2 + 5)
+            .map(|i| w.deny_of(i))
+            .collect()
+    };
+    // A windowed pool puts competing decisions in the SAME state, where the
+    // cut settles them before any join is asked — so the pair that must
+    // disagree is given a state each, explicitly. Without this the sweep
+    // passes with `tombstone` removed from the decision order, which is D2.
+    let mut states: Vec<SetState> = vec![
+        SetState::default(),
+        w.state(vec![w.item(1, b"b", 2, b"")]),
+        w.state(vec![w.tombstone(1, b"b", 2)]),
+    ];
+    for i in 0..9 {
         let items: Vec<Item> = (0..3).map(|k| pool[(i + k) % pool.len()].clone()).collect();
         let deny = match i % 4 {
-            1 => vec![denials[0].clone()],
-            2 => vec![denials[1].clone()],
-            3 => vec![denials[0].clone(), denials[1].clone()],
+            1 => vec![w.deny_of(1)],
+            2 => block(1),
+            3 => block(MAX_DENY as usize / 2 + 6),
             _ => Vec::new(),
         };
         states.push(w.state_with(items, deny));
     }
-    states.push(w.state_with(vec![], vec![denials[0].clone()]));
-    states.push(w.state_with(vec![], vec![denials[1].clone()]));
     assert_eq!(states.len(), 12);
+    assert_ne!(
+        states[1].decisions(),
+        states[2].decisions(),
+        "the live-empty and the tombstone must really be different states"
+    );
+    for s in &states {
+        assert!(
+            craftec_set_contract::read(&w.params_bytes, &s.encode()).is_some(),
+            "every generated state must itself parse"
+        );
+    }
 
     let mut nontrivial = 0;
+    let mut overflowed = 0;
     for a in &states {
         assert_eq!(
             join(a, a, &w.params).decisions(),
@@ -572,11 +612,20 @@ fn the_laws_hold_over_every_triple_of_twelve_generated_states() {
             "idempotence"
         );
         for b in &states {
+            let ab = join(a, b, &w.params);
             assert_eq!(
-                join(a, b, &w.params).decisions(),
+                ab.decisions(),
                 join(b, a, &w.params).decisions(),
                 "commutativity"
             );
+            // Closure: the join of two states that parse must parse.
+            assert!(
+                craftec_set_contract::read(&w.params_bytes, &ab.encode()).is_some(),
+                "the join produced a state the contract refuses"
+            );
+            if a.deny.len() + b.deny.len() > MAX_DENY as usize {
+                overflowed += 1;
+            }
             for c in &states {
                 let l = join(&join(a, b, &w.params), c, &w.params);
                 let r = join(a, &join(b, c, &w.params), &w.params);
@@ -591,73 +640,104 @@ fn the_laws_hold_over_every_triple_of_twelve_generated_states() {
         nontrivial > 1000,
         "only {nontrivial} of 1728 triples actually merged anything"
     );
+    assert!(
+        overflowed > 0,
+        "no pair in the sweep overflowed the deny cap: D1's boundary is untested"
+    );
 }
 
-/// A second witness of a decision already held must not rewrite the state.
+/// Every bound `parse` enforces, `join` must enforce on its OUTPUT — or the
+/// contract can manufacture a state it then refuses.
 ///
-/// The join keeps the INCUMBENT on an exact tie, and that is load-bearing
-/// rather than tidy: a decision has many possible witnesses — another signature
-/// over it, another stamp nonce, a different grant that admits the same signer
-/// — and if any of them displaced what is held, a key holder could make every
-/// host rewrite its state and wake every subscriber, for free, for ever.
-///
-/// This has to be tested at the JOIN. The `update_state` path drops an
-/// equal-ranked candidate in `absorb` before the join is reached, so a test
-/// through the contract interface passes whatever the join does with a tie —
-/// which is exactly how `>` becoming `>=` survived a mutation sweep.
-///
-/// Stated as "neither side is rewritten" rather than "both sides agree",
-/// because the two states are genuinely different encodings of one fact: each
-/// keeps its own witness, and that is the whole point.
+/// D1 (architect): `parse` refuses more than `MAX_DENY` denials and the join
+/// unioned the deny lists without a cut, so two states that each parse could
+/// merge into one that does not. Under F23 the host validates its own merge
+/// result, refuses it, and the two replicas never converge — reachable by one
+/// honest owner denying from two devices that were apart.
 #[test]
-fn a_second_witness_of_a_held_decision_never_rewrites_the_state() {
-    let w = world();
-    let held = w.state(vec![w.item_full(1, b"k", 5, b"v", false, false, 0)]);
-
-    // Three ways to witness the same decision differently.
-    let other_nonce = w.state(vec![w.item_full(1, b"k", 5, b"v", false, false, 91)]);
-    let other_grant = {
-        let mut it = w.item_full(1, b"k", 5, b"v", false, false, 0);
-        // A narrower grant that still admits this bucket: a different witness
-        // of the same right, carried by the same item.
-        it.cap = Some(w.cap_for(1, 0, 9));
-        w.resign(&mut it, 1);
-        w.state(vec![it])
-    };
-
-    for (what, other) in [
-        ("another stamp nonce", other_nonce),
-        ("another grant", other_grant),
-    ] {
-        assert_ne!(
-            other.encode(),
-            held.encode(),
-            "{what}: the fixture must really be a different encoding"
-        );
-        assert_eq!(
-            other.decisions(),
-            held.decisions(),
-            "{what}: and the same decision"
-        );
-        assert_eq!(
-            join(&held, &other, &w.params).encode(),
-            held.encode(),
-            "{what}: merging it in rewrote the held state"
-        );
-        assert_eq!(
-            join(&other, &held, &w.params).encode(),
-            other.encode(),
-            "{what}: the other side was rewritten instead"
-        );
-    }
-
-    // Control: a decision that really is greater DOES replace the witness, so
-    // the four assertions above are about ties and not about the join refusing
-    // to update at all.
-    let newer = w.state(vec![w.item(1, b"k", 6, b"newer")]);
-    assert_ne!(
-        join(&held, &newer, &w.params).encode(),
-        held.encode(),
-        "a greater decision must replace what is held"
+fn the_join_of_any_two_states_that_parse_parses() {
+    let n = MAX_DENY as usize + 40;
+    let w = world_with(13, n, Admission::Cap, 4, 2, 0);
+    let parses = |s: &SetState| craftec_set_contract::read(&w.params_bytes, &s.encode()).is_some();
+    // Two honest halves, disjoint, each within the cap.
+    let half = MAX_DENY as usize / 2 + 5;
+    let a = w.state_with(
+        vec![w.item(0, b"a", 1, b"v")],
+        (1..=half).map(|i| w.deny_of(i)).collect(),
     );
+    let b = w.state_with(
+        vec![w.item(0, b"b", 1, b"v")],
+        (half + 1..=2 * half).map(|i| w.deny_of(i)).collect(),
+    );
+    assert!(
+        parses(&a) && parses(&b),
+        "both halves must parse on their own"
+    );
+    assert!(
+        a.deny.len() + b.deny.len() > MAX_DENY as usize,
+        "the fixture must actually overflow the cap"
+    );
+    let merged = join(&a, &b, &w.params);
+    assert!(
+        merged.deny.len() <= MAX_DENY as usize,
+        "the join produced {} denials, over the cap of {MAX_DENY}",
+        merged.deny.len()
+    );
+    assert!(parses(&merged), "the join produced a state it would refuse");
+    // And the cut is a join in its own right: same answer either way round.
+    assert_eq!(join(&b, &a, &w.params).decisions(), merged.decisions());
+}
+
+/// D2 (architect): the decision order must be TOTAL on decisions, or the join
+/// is not commutative on the projection the laws are stated over.
+///
+/// A tombstone carries an empty payload and a live item may carry one too, so
+/// before `tombstone` entered the order the two had equal rank at one `ts` —
+/// different decisions, equal rank, incumbent wins, and two replicas disagree
+/// for ever about whether the slot is deleted while their summaries differ, so
+/// they re-send to each other on every exchange without either changing.
+#[test]
+fn equal_rank_means_equal_decision() {
+    let w = world();
+    let live_empty = w.item(1, b"k", 5, b"");
+    let dead = w.tombstone(1, b"k", 5);
+    assert_ne!(
+        live_empty.decision(),
+        dead.decision(),
+        "the fixture must be two different decisions"
+    );
+    assert_ne!(
+        live_empty.decision().rank(),
+        dead.decision().rank(),
+        "equal rank for two different decisions: the order is not total"
+    );
+
+    // The join therefore agrees on the projection, both ways round.
+    let (a, b) = (w.state(vec![live_empty]), w.state(vec![dead]));
+    assert_eq!(
+        join(&a, &b, &w.params).decisions(),
+        join(&b, &a, &w.params).decisions(),
+        "not commutative on decisions"
+    );
+    // A delete beats a live item at the same ts: a slot deleted stays deleted.
+    assert!(join(&a, &b, &w.params).held[0].item.tombstone);
+
+    // The property, over every decision the format allows at one ts.
+    let all = [
+        w.item(1, b"k", 5, b""),
+        w.item(1, b"k", 5, b"x"),
+        w.tombstone(1, b"k", 5),
+        w.sealed(1, b"k", 5, b""),
+        w.sealed(1, b"k", 5, b"x"),
+        w.item_full(1, b"k", 5, b"", true, true, 0),
+    ];
+    for x in &all {
+        for y in &all {
+            assert_eq!(
+                x.decision().rank() == y.decision().rank(),
+                x.decision() == y.decision(),
+                "rank and decision disagree about equality"
+            );
+        }
+    }
 }

@@ -23,11 +23,21 @@ cargo build --quiet --release --target wasm32-unknown-unknown --manifest-path wa
 harness=wasm-check/target/wasm32-unknown-unknown/release/wasm_check.wasm
 # WHICH binary was timed, printed rather than assumed: a timing run over a
 # stale or differently-built artefact reads exactly like a fast one. The size
-# is the observable that separates the two modes — 113,759 B hardened against
-# 118,899 B not, at the time of writing — because this profile sets
+# and the mode are what separate the two builds; this profile sets
 # `strip = true`, so the source paths that distinguish a contract's two builds
 # are gone from the harness either way.
-echo "harness: $(wc -c < "$harness" | tr -d ' ') B sha256=$(shasum -a 256 "$harness" | cut -c1-16)$([ -n "${CHECK_WASM_UNHARDENED:-}" ] && echo ' UNHARDENED' || echo ' (contract flags)')"
+#
+# NOT the hash. This crate is its own `[workspace]` and depends on the four
+# contracts by `path = "../<name>"`, which is OUTSIDE that workspace root —
+# and cargo hashes a path dependency's package id relative to the workspace
+# root only when the path is inside it, absolutely when it is not. Measured
+# (#37): two checkouts of one commit at different absolute paths built this
+# harness to the same 167,949 bytes under two different hashes, while
+# `block.wasm` in the same two directories was identical. A hash printed here
+# would be an identity that is true on one machine, which is worse than no
+# identity at all. The contracts are unaffected — no contract crate has a path
+# dependency on another of ours.
+echo "harness: $(wc -c < "$harness" | tr -d ' ') B$([ -n "${CHECK_WASM_UNHARDENED:-}" ] && echo ' UNHARDENED' || echo ' (contract flags)')"
 node - <<'JS'
 const fs = require('fs');
 const path = 'wasm-check/target/wasm32-unknown-unknown/release/wasm_check.wasm';

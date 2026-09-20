@@ -40,12 +40,92 @@
 # are in `./build.sh`'s output, in the README and in the pull request that
 # produced them, described there as the current build.
 
+# THE SHAPE OF A ROW
+#
+# A hash is not a record of its inputs. The map from inputs to hash is not
+# injective: #36 produced six distinct hashes over sixteen builds of one source,
+# two of which collided, so "the hash matched" can never stand in for "the
+# inputs were these". A row therefore carries the INPUTS, and
+# `./release-check.sh <n>` performs the build they describe — at a different
+# absolute path — and compares what comes out.
+#
+# Every field below exists because something that is NOT in the source has been
+# measured moving the bytes.
+#
 # [[epoch]]
-# number      = 1
-# released    = "YYYY-MM-DD"
-# tag         = "vX.Y.Z"
-# toolchain   = "1.97.1"
-# serves_until = ""              # set when epoch 2 is published
-# [epoch.code]
-# block    = "sha256:…"
-# register = "sha256:…"
+# number   = 1
+# released = "YYYY-MM-DD"
+# tag      = "vX.Y.Z"
+# builder  = "who ran the release build"
+#
+# [epoch.source]
+# repo   = "https://github.com/craft-ec/freenet-contracts"
+# commit = "<full 40 hex>"        # full, never short: a short rev is ambiguous
+#                                 # for exactly the thing a release pins
+# dirty  = false                  # a dirty tree is not a release, and
+#                                 # release-check refuses a row that says true
+#
+# [epoch.toolchain]
+# channel   = "1.97.1"            # rust-toolchain.toml
+# rustc     = "rustc 1.97.1 (<hash> <date>)"    # `rustc -vV` line 1, verbatim
+# llvm      = "<LLVM version>"    # from the same output
+# cargo     = "cargo 1.97.1 (<hash> <date>)"    # `cargo -vV` line 1, verbatim
+# target    = "wasm32-unknown-unknown"
+# bootstrap = true                # RUSTC_BOOTSTRAP=1, which the -Z flag needs
+#                                 # and which ties the bytes to this toolchain
+#
+# [epoch.profile]                 # asserted field by field against each
+# opt_level     = "z"             # contract's Cargo.toml, so a profile edit
+# lto           = true            # without a row is caught at the door and not
+# codegen_units = 1               # as an unexplained hash
+# panic         = "abort"
+# strip         = true
+# debug         = false
+#
+# [epoch.flags]
+# location_detail = "none"        # -Zlocation-detail=none
+# # IN ORDER, and the order is part of the input: rustc applies the LAST
+# # --remap-path-prefix whose prefix matches. Written as the DERIVATION rather
+# # than as one machine's absolute paths — a row full of /Users/... is not a row
+# # anyone else can rebuild from.
+# remap = [
+#   "$RUSTUP_HOME=/rustup",
+#   "$CARGO_HOME=/cargo",
+#   "$REPO=/contracts",
+#   "$REPO/<contract>=/<contract>",
+#   "$CARGO_HOME/registry/src/<index>=/registry",
+#   "$CARGO_HOME/git/checkouts/<pkg>-<hash>/<rev>=/dep/<pkg>",
+# ]
+# remap_expanded = 16             # how many the globs produced on the release
+#                                 # machine. DIAGNOSTIC ONLY, and release-check
+#                                 # does not compare it: an extra remap that
+#                                 # matches nothing was measured not to move the
+#                                 # hash (#37), so one developer's cargo cache
+#                                 # does not re-key a contract.
+#
+# [epoch.postprocess]
+# tools = []                      # EMPTY, and checked: release-check asserts
+#                                 # build/<k>.wasm is byte-identical to what
+#                                 # cargo left in target/. Nothing in this repo
+#                                 # post-processes a wasm today.
+#
+# # One table per contract: each has its own workspace, so each has its own
+# # lockfile.
+# [epoch.contract.block]
+# lock_sha256 = "sha256:…"        # THE LOAD-BEARING FIELD. A dependency's
+#                                 # identity reaches codegen: changing only the
+#                                 # `version` field of a dependency whose source
+#                                 # is byte-identical took block.wasm from 551
+#                                 # functions and 124,020 B to 543 and 123,393 B
+#                                 # (#37). A patch bump is an epoch, and the
+#                                 # lock is what records every version.
+# sha256      = "sha256:…"
+# bytes       = 123393            # beside the hash: an equal length with a
+#                                 # different hash and a different length are
+#                                 # different faults
+#
+# [epoch.contract.block.git_deps]
+# "freenet-prolly" = "<full 40 hex>"   # recorded beside the lock hash, not
+#                                      # instead of it: the lock detects any
+#                                      # change at all, the rev is what a reader
+#                                      # can go and check out

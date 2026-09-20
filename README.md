@@ -34,9 +34,10 @@ specified where the head is.
 
 The hash is part of the contract's network key, so what goes into it matters.
 It commits to **the compiled code** — this repo's source, the pinned source of
-every dependency, the toolchain and the build flags — and to nothing else. In
-particular it does not commit to where any of that lived on disk, nor to which
-LINE of a file a statement sits on.
+every dependency, the toolchain and the build flags — **and to every
+dependency's cargo IDENTITY, which is not its source** (see below). It does not
+commit to where any of that lived on disk, nor to which LINE of a file a
+statement sits on.
 
 Both used to leak, through panic locations. Every `unwrap`, `expect`, index,
 `/`, `%` and `#[track_caller]` callee records `file:line:col`, and those
@@ -48,7 +49,9 @@ strings reach the binary:
 - **Directory names.** Cargo unpacks a git dependency into a directory named
   after the REVISION, so two revisions with identical code produced different
   wasm (#11); and the absolute path of cargo's own home was in the binary, so
-  the same source built on two machines did not agree.
+  the same source built on two machines did not agree. The remaps closed the
+  STRING leak. They did not close the identity one — #36 found the same symptom
+  surviving them, for a different reason, below.
 
 `contract-build.sh` — one copy of the flags for every contract, because three
 contracts built three slightly different ways is the failure worth preventing
@@ -76,6 +79,65 @@ are not covered by the flag, so this is a live exposure and not a cosmetic one.
 tied to that exact toolchain. A toolchain bump was always an epoch (#8), so
 that is not a new exposure. The flags reach the wasm target only: `cargo test`
 and native builds are untouched, and panics there keep their locations.
+
+### A dependency's IDENTITY reaches the binary, and its source does not decide the bytes
+
+Two revisions of `freenet-prolly` whose only source difference was inside
+`#[cfg(test)]` produced two different `block.wasm` (#36). It is not a path
+string: rebuilt with byte-identical `RUSTFLAGS` that remapped both dependency
+directories to the same name, the two hashes still differed. Cargo derives each
+dependency's `-C metadata` from its **package id** — which for a git dependency
+carries the revision, for a registry dependency the version, and for a path
+dependency the path, absolute unless it is inside the workspace root — and
+rustc mixes `-C metadata` into the crate's stable id and so into the symbol
+hashes of its items.
+
+What that does to the output was measured twice, and the second time is the
+one that matters:
+
+- Between two `freenet-prolly` revisions: a pure reordering, a 6-cycle over
+  functions 45–50, all 543 bodies identical, plus one call operand.
+- Changing **only the `version` field** of a vendored dependency whose source
+  is byte-identical: `block.wasm` went from 551 functions and 124,020 B to 543
+  and 123,393 B (#37). Not a reordering — the code itself differs, because
+  under `lto = true` and `codegen-units = 1` those symbol hashes reach LLVM's
+  inlining and merging decisions.
+
+Three consequences, all of them load-bearing:
+
+1. **A dependency bump is an epoch, even a patch bump, even one whose source
+   the contract never reaches.** There is nothing to "check whether it really
+   changed": the version string alone re-keys the contract.
+2. **Equal hashes for two different revisions are a COLLISION, not a
+   guarantee.** The map from inputs to hash is not injective — sixteen builds
+   of one source produced six distinct hashes, two of which collided. A hash
+   can never stand in for a record of its inputs, which is what `released.toml`
+   rows and `./release-check.sh` are for.
+3. **A path dependency outside its own workspace root makes the hash depend on
+   the CHECKOUT LOCATION.** Cargo hashes such an id absolutely. No contract has
+   one; `wasm-check` does, which is why `check-wasm.sh` prints that harness's
+   size and not its hash.
+
+### Rebuilding a release from its row
+
+`./release-check.sh <epoch>` takes a `released.toml` row, checks out the commit
+it names **at a different absolute path**, asserts the toolchain, each
+contract's `Cargo.lock` digest, its git-dependency revisions and its profile
+field by field, and only then rebuilds and compares the hash and the byte
+count. It also asserts that nothing touched the wasm after cargo, which is what
+makes `postprocess.tools = []` a checked claim rather than an asserted one.
+
+It does not gate ON the table: every value is used as an input to the rebuild or
+as an assertion about the environment, so editing a row can only turn it red.
+A missing field is a FAILURE, not a skip.
+
+`./release-check.sh --write <n> --tag <t>` emits the row, refusing a dirty tree
+or a tag that is not at HEAD — the first row is written by the gate, never by
+hand. `./release-check.sh --self-test` writes a row, verifies it, then puts each
+field back wrong and requires the gate to say which field: every mutant must be
+caught, and all but one must be caught BEFORE the rebuild, because the cheap
+assertions exist so that a wrong row costs seconds instead of a cold build of
+every contract.
 
 ### The hash gate asserts properties, never a constant
 

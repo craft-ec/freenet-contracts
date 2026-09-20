@@ -31,14 +31,31 @@ pub struct World {
     pub k: usize,
 }
 
+/// The `i`th key of the keyset `seed` names.
+///
+/// Derived through a hash rather than by arithmetic on the seed. The previous
+/// form was `[i as u8 + 1 + seed * 64; 32]`, and `seed * 64` overflows a `u8`
+/// at seed 4: a panic in debug, and in release a wrap with period 4, so only
+/// FOUR distinct keysets existed and runs with different seeds silently shared
+/// a contract key and inherited each other's state.
+///
+/// A hash is injective here for every `(seed, i)` a test can ask for, and it is
+/// still deterministic — which is the whole requirement. `i` is taken as a
+/// `u16` so a keyset larger than 255 cannot alias either.
+fn signer_for(seed: u8, i: usize) -> SigningKey {
+    let mut h = blake3::Hasher::new();
+    h.update(b"RG01-testkey");
+    h.update(&[seed]);
+    h.update(&(i as u16).to_le_bytes());
+    SigningKey::from_bytes(h.finalize().as_bytes())
+}
+
 /// A k-of-n register. `n = 1, k = 1` with `mode0 = true` gives the single-key
 /// form instead. `seed` picks the keys, so two worlds can hold genuinely
 /// different keysets — a fixture whose "other" keys are the same keys proves
 /// nothing about a wrong-key refusal.
 pub fn keyset_seeded(seed: u8, k: usize, n: usize, mode0: bool) -> World {
-    let mut signers: Vec<SigningKey> = (0..n)
-        .map(|i| SigningKey::from_bytes(&[i as u8 + 1 + seed * 64; 32]))
-        .collect();
+    let mut signers: Vec<SigningKey> = (0..n).map(|i| signer_for(seed, i)).collect();
     // The keyset is sorted by public key, and the bitmap indexes that order.
     signers.sort_by_key(|s| s.verifying_key().to_bytes());
     let mut params_bytes = Vec::from(*MAGIC);
@@ -377,6 +394,76 @@ impl World {
                 sigs,
             },
             value: value.to_vec(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod seeded_keys {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    /// Every seed builds, and no two seeds share a key.
+    ///
+    /// The old form panicked in debug from seed 4 and, in release, wrapped with
+    /// period 4 — so four keysets served all 256 seeds and runs that believed
+    /// they were independent shared a contract key. Two sampled seeds would not
+    /// have caught that: seeds 0 and 1 differ under both forms. The whole range
+    /// is swept, and every key of every seed is required to be distinct.
+    #[test]
+    fn every_seed_builds_and_no_two_seeds_share_a_key() {
+        const N: usize = 4;
+        let mut seen: BTreeSet<[u8; 32]> = BTreeSet::new();
+        for seed in 0..=u8::MAX {
+            let w = keyset_seeded(seed, 2, N, false);
+            assert_eq!(w.signers.len(), N, "seed {seed} built the wrong keyset");
+            for s in &w.signers {
+                assert!(
+                    seen.insert(s.verifying_key().to_bytes()),
+                    "seed {seed} reuses a key another seed already had"
+                );
+            }
+        }
+        assert_eq!(seen.len(), 256 * N, "some keys were shared");
+    }
+
+    /// And therefore no two seeds share a CONTRACT KEY — which is what made
+    /// the bug leak state between runs rather than merely repeat keys.
+    #[test]
+    fn no_two_seeds_share_a_contract_key() {
+        let mut seen: BTreeSet<Vec<u8>> = BTreeSet::new();
+        for seed in 0..=u8::MAX {
+            let w = keyset_seeded(seed, 2, 4, false);
+            assert!(
+                seen.insert(w.params_bytes.clone()),
+                "seed {seed} produces params another seed already produced"
+            );
+        }
+        assert_eq!(seen.len(), 256);
+    }
+
+    /// A keyset larger than 255 is still injective — the old single-byte index
+    /// would have aliased, and `MAX_N` is only 16 today but the helper is not
+    /// what should enforce that.
+    #[test]
+    fn a_large_keyset_does_not_alias() {
+        let mut seen: BTreeSet<[u8; 32]> = BTreeSet::new();
+        for i in 0..300usize {
+            assert!(
+                seen.insert(signer_for(7, i).verifying_key().to_bytes()),
+                "key {i} aliases an earlier one"
+            );
+        }
+    }
+
+    /// Deterministic: the same seed gives the same keys, or a frozen vector
+    /// somewhere else would move every time the suite ran.
+    #[test]
+    fn the_same_seed_gives_the_same_keys() {
+        for seed in [0u8, 1, 4, 255] {
+            let a = keyset_seeded(seed, 2, 4, false);
+            let b = keyset_seeded(seed, 2, 4, false);
+            assert_eq!(a.params_bytes, b.params_bytes);
         }
     }
 }

@@ -17,11 +17,17 @@ craftec-bag-contract = { path = "../bag", default-features = false, features = [
 craftec-set-contract = { path = "../set", default-features = false, features = ["testing"] }
 freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "9764b86" }
 
+# The contracts' profile, field for field. check-wasm.sh times this crate
+# with the flags a contract ships with precisely so the number is about the
+# code that ships; a profile that differs in a field which changes codegen
+# would make it a number about something else. `debug` was the one that
+# differed.
 [profile.release]
 opt-level = "z"
 lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+debug = false
 
 [workspace]

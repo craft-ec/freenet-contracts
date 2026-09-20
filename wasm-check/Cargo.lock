@@ -192,7 +192,7 @@ name = "craftec-block-contract"
 version = "0.1.0"
 dependencies = [
  "blake3",
- "freenet-prolly 0.1.0 (git+https://github.com/craft-ec/freenet-prolly?rev=e2756c8)",
+ "freenet-prolly",
  "freenet-stdlib",
 ]
 
@@ -432,15 +432,7 @@ dependencies = [
 [[package]]
 name = "freenet-prolly"
 version = "0.1.0"
-source = "git+https://github.com/craft-ec/freenet-prolly?rev=e2756c8#e2756c850b49994086d2b8b59bb67569d37acc71"
-dependencies = [
- "blake3",
-]
-
-[[package]]
-name = "freenet-prolly"
-version = "0.1.0"
-source = "git+https://github.com/craft-ec/freenet-prolly?rev=ebbc34f#ebbc34fba8403798dba153219137562745e5d8b7"
+source = "git+https://github.com/craft-ec/freenet-prolly?rev=46c50ff#46c50ffc3ee5f406b6102577c7d3847027a97f79"
 dependencies = [
  "blake3",
 ]
@@ -1238,7 +1230,7 @@ dependencies = [
  "craftec-block-contract",
  "craftec-register-contract",
  "craftec-set-contract",
- "freenet-prolly 0.1.0 (git+https://github.com/craft-ec/freenet-prolly?rev=ebbc34f)",
+ "freenet-prolly",
 ]
 
 [[package]]

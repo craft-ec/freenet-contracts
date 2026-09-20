@@ -27,12 +27,18 @@ pub fn world_with(
     quota: u16,
     decision_bits: u8,
 ) -> World {
+    // Derived through a hash rather than by writing `seed` and `i` into fixed
+    // bytes. The old form put `i as u8 + 1` in one byte, which aliases once a
+    // fixture asks for more than 255 keys — and this crate's own reserve tests
+    // ask for `MAX_DENY * 2 + 8`. Injective for every `(seed, i)`, and still
+    // deterministic, which is the whole requirement.
     let keys: Vec<SigningKey> = (0..n)
         .map(|i| {
-            let mut b = [0u8; 32];
-            b[0] = seed;
-            b[1] = i as u8 + 1;
-            SigningKey::from_bytes(&b)
+            let mut h = blake3::Hasher::new();
+            h.update(b"ST01-testkey");
+            h.update(&[seed]);
+            h.update(&(i as u16).to_le_bytes());
+            SigningKey::from_bytes(h.finalize().as_bytes())
         })
         .collect();
     let params = Params {

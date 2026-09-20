@@ -161,6 +161,17 @@ much as the absences: an empty binary satisfies every "no X" check, and
 `/cargo/registry/src/…` contains the substring `/registry/` while the registry
 remap is doing nothing, so the check is anchored to the start of the path.
 
+It also asks cargo what each contract's wasm dependency CLOSURE contains, and
+requires the instrumentation crate to be absent from it. That check exists
+because a dependency's identity reaches the hash even when nothing calls it
+(F37), so merely depending on a probe crate would re-key every contract — an
+epoch bought by an unused import. It is deliberately not done by comparing
+hashes with and without: the input→hash map is not one-to-one, so a coinciding
+hash proves nothing about the closure, and that is exactly the case this guards.
+A dev-dependency is fine and stays fine — it is in the native test build and
+absent from the wasm, which is the pattern the contracts' `testing` feature
+already follows.
+
 What the gate deliberately does not do is compare against an expected hash. A
 pinned constant goes red on every legitimate code change, and whoever bumps it
 to go green has silently declared an epoch. Released hashes live in

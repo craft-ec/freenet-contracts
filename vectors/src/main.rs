@@ -233,7 +233,7 @@ fn bag_cases() -> Vec<Case> {
     let p = params(0, 12);
     let pb = p.encode();
     let mut out = Vec::new();
-    for (name, n) in [("bag-empty", 0usize), ("bag-1", 1), ("bag-full", 12)] {
+    for (name, n) in [("bag-empty", 0usize), ("bag-1", 1), ("bag-2", 2), ("bag-half", 6), ("bag-full", 12)] {
         let state = collect(many(&p, n, 4), &p).encode();
         let expect = verdict(&pb, &state);
         declared_accept(name, expect);
@@ -249,17 +249,52 @@ fn bag_cases() -> Vec<Case> {
 fn set_cases() -> Vec<Case> {
     use craftec_set_contract::read;
     use craftec_set_contract::testing::world;
-    use craftec_set_contract::wire::SetState;
+    use craftec_set_contract::wire::{SetState, MAX_M};
 
     let verdict = |p: &[u8], s: &[u8]| read(p, s).is_some();
     let w = world();
     let pb = w.params_bytes.clone();
     let mut out = Vec::new();
+    // Drawn from the same pool the merge sweep uses, so the corpus sits ON the
+    // boundaries the parser enforces rather than in the easy interior: empty
+    // payloads, EQUAL timestamps (the tie the ordering has to settle), a
+    // tombstone, a sealed item, and a state at the item cap.
+    let equal_ts = vec![w.item(0, b"e1", 7, b""), w.item(0, b"e2", 7, b"")];
+    let mixed = vec![
+        w.item(0, b"a", 1, b"owner writes"),
+        w.tombstone(0, b"gone", 2),
+        w.sealed(0, b"s", 3, b"sealed payload"),
+        w.item(1, b"b", 2, b"cap holder writes"),
+    ];
+    let at_cap: Vec<_> = (0..MAX_M.min(16))
+        .map(|i| w.item(0, format!("k{i:03}").as_bytes(), i as u64 + 1, b""))
+        .collect();
     for (name, items) in [
         ("set-empty", vec![]),
         ("set-two", vec![w.item(0, b"a", 1, b"owner writes"), w.item(1, b"b", 2, b"cap holder writes")]),
+        ("set-empty-payloads-equal-ts", equal_ts),
+        ("set-tombstone-and-sealed", mixed),
+        ("set-at-cap", at_cap),
+        ("set-one-item", vec![w.item(0, b"only", 1, b"x")]),
+        ("set-multi-signer", vec![
+            w.item(0, b"o", 1, b"owner"),
+            w.item(1, b"c1", 2, b"cap one"),
+            w.item(2, b"c2", 3, b"cap two"),
+        ]),
     ] {
         let state = if items.is_empty() { w.encode(&SetState::default()) } else { w.encode(&w.state(items)) };
+        let expect = verdict(&pb, &state);
+        declared_accept(name, expect);
+        out.push(Case { contract: "set", name: name.into(), params: pb.clone(), state, expect });
+    }
+    // A DENY list is a second lattice inside the same state, with its own cap,
+    // and it is the part a merge has to cut correctly — so it belongs in the
+    // corpus rather than only in the merge sweep.
+    for (name, deny) in [
+        ("set-one-deny", vec![w.deny_of(1)]),
+        ("set-two-denies", vec![w.deny_of(1), w.deny_of(2)]),
+    ] {
+        let state = w.encode(&w.state_with(vec![w.item(0, b"a", 1, b"owner")], deny));
         let expect = verdict(&pb, &state);
         declared_accept(name, expect);
         out.push(Case { contract: "set", name: name.into(), params: pb.clone(), state, expect });
@@ -286,11 +321,25 @@ fn register_cases() -> Vec<Case> {
     for (name, seq, value) in [
         ("register-1", 1u64, &b"value"[..]),
         ("register-2", 7u64, &b"another value"[..]),
+        ("register-empty-value", 3u64, &b""[..]),
+        ("register-seq-0", 0u64, &b"first"[..]),
+        ("register-seq-max", u64::MAX, &b"last"[..]),
     ] {
         let state = w.encode(&w.state(w.record(false, seq, value)));
         let expect = verdict(&pb, &state);
         declared_accept(name, expect);
         out.push(Case { contract: "register", name: name.into(), params: pb.clone(), state, expect });
+    }
+    // Every legal ENCODING of one record. The contract accepts more than one
+    // byte string for the same logical record (signer subsets, and mode-0's
+    // absent bitmap), and an optimiser bug that rejected one of them would be
+    // invisible to a corpus that only ever built the canonical form.
+    for (i, r) in w.all_encodings(false, 5, b"encodings").into_iter().enumerate() {
+        let state = w.encode(&w.state(r));
+        let expect = verdict(&pb, &state);
+        let name = format!("register-encoding-{i}");
+        declared_accept(&name, expect);
+        out.push(Case { contract: "register", name, params: pb.clone(), state, expect });
     }
     let base: Vec<Case> = out.iter().filter(|c| c.expect)
         .map(|c| Case { contract: c.contract, name: c.name.clone(), params: c.params.clone(), state: c.state.clone(), expect: c.expect })
@@ -325,18 +374,35 @@ fn main() {
 
     // A corpus with no accepted cases passes any differential while proving
     // nothing, so it is a FAILURE here rather than a quiet success.
+    // Floors on BOTH columns, per contract. "At least one accepted" is too weak
+    // to be a floor: a corpus can lose most of its accepted cases to a fixture
+    // change and still pass it, and a thin ACCEPTED column is where an
+    // optimiser bug hides — refusals mostly fail at the first length check and
+    // never reach the code an optimiser rearranged.
+    const MIN_ACCEPTED: usize = 8;
+    const MIN_REFUSED: usize = 20;
+    let mut short = Vec::new();
     for contract in ["block", "bag", "register", "set"] {
         let n = all.iter().filter(|c| c.contract == contract).count();
         let acc = all
             .iter()
             .filter(|c| c.contract == contract && c.expect)
             .count();
-        assert!(
-            acc > 0,
-            "{contract}: {n} cases and NONE accepted — a differential over this \
-             corpus would compare two builds that both refuse everything"
+        let ref_ = n - acc;
+        println!(
+            "{contract:10} {n:5} cases, {acc:4} accepted, {ref_:4} refused{}",
+            if acc < MIN_ACCEPTED || ref_ < MIN_REFUSED { "   BELOW FLOOR" } else { "" }
         );
-        println!("{contract:10} {n:5} cases, {acc:4} accepted, {:4} refused", n - acc);
+        if acc < MIN_ACCEPTED || ref_ < MIN_REFUSED {
+            short.push(format!("{contract} ({acc} accepted, {ref_} refused)"));
+        }
     }
+    assert!(
+        short.is_empty(),
+        "below the corpus floor ({MIN_ACCEPTED} accepted, {MIN_REFUSED} refused per \
+         contract): {}. A thin corpus still passes a differential — it just stops \
+         being evidence.",
+        short.join("; ")
+    );
     println!("wrote {path}");
 }

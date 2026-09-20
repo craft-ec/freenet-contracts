@@ -31,6 +31,14 @@
 # with, from this one definition, rather than a second copy of them.
 set -euo pipefail
 
+# The binaryen release these bytes were produced with. Changing it changes every
+# contract hash, which is a network EPOCH — see #39.
+WANT_BINARYEN=125
+# Measured in #39: --enable-nontrapping-float-to-int --enable-sign-ext makes
+# wasm-opt write nothing at all, with no error and no exit status. These two are
+# the set that works.
+WASM_OPT_FLAGS=(--enable-bulk-memory-opt --enable-bulk-memory)
+
 flags_only=
 if [ "${1:-}" = --flags ]; then flags_only=1; dir=$2; crate=; shift 2
 else dir=$1; crate=$2; shift 2; fi
@@ -123,4 +131,57 @@ cargo build --locked --release --target wasm32-unknown-unknown "$@"
 mkdir -p ../build
 wasm=../build/$out.wasm
 cp "target/wasm32-unknown-unknown/release/${crate//-/_}.wasm" "$wasm"
+
+# wasm-opt -Os. ~18% off every contract, and ~120 KiB of contract rides every
+# PUT at every hop (F28). Measured in #39: -Os takes essentially all of -Oz's
+# gain (-Oz beats it by 12-184 BYTES) and costs no validation time, so the
+# less aggressive level is the one that ships.
+#
+# NOT applied to the two control builds. `.remaps-only` exists so the hash gate
+# can read PATHS out of the wasm — it is the only build in which a broken remap
+# is observable — and an optimiser between the compiler and that check could
+# move or drop the very strings it reads, turning a real gate into a silent
+# one. `.unhardened` is left alone for the same reason: a control is only a
+# control if nothing else happened to it.
+# `CONTRACT_BUILD_NO_WASM_OPT` produces the same compile with the optimiser
+# skipped. It exists for the differential gate: once -Os is what ships, "does
+# wasm-opt change behaviour" can only be asked against a reference built the
+# same way in every OTHER respect, and rebuilding one with different RUSTFLAGS
+# would be comparing two things at once. The output is still written to
+# `build/<dir>.wasm`, so a caller that wants both must move the first aside —
+# `wasmopt-check.sh` does exactly that.
+if [ -n "${CONTRACT_BUILD_NO_WASM_OPT:-}" ]; then
+  echo "contract-build: wasm-opt SKIPPED ($dir) — reference build, not a contract" >&2
+elif [ "$out" = "$dir" ]; then
+  command -v wasm-opt >/dev/null ||
+    { echo "contract-build: wasm-opt is required (binaryen $WANT_BINARYEN)" >&2; exit 1; }
+  # PINNED, and asserted. wasm-opt's output is reproducible for a given
+  # binaryen but NOT across versions, so an unpinned tool would silently move
+  # every contract hash — a network epoch — on somebody's next brew upgrade.
+  got=$(wasm-opt --version | awk '{print $NF}')
+  [ "$got" = "$WANT_BINARYEN" ] ||
+    { echo "contract-build: binaryen $got, expected $WANT_BINARYEN." >&2
+      echo "contract-build: a different binaryen produces different bytes, and these bytes" >&2
+      echo "contract-build: are a network key. Install binaryen $WANT_BINARYEN or change" >&2
+      echo "contract-build: WANT_BINARYEN here, which is an EPOCH." >&2
+      exit 1; }
+  before=$(wc -c < "$wasm" | tr -d ' ')
+  # wasm-opt FAILS SILENTLY on a feature flag it does not accept: no error, no
+  # exit status, and NO OUTPUT FILE. `-o` to a temporary and a check that the
+  # file exists is what makes that a failure instead of a build that quietly
+  # ships the previous artefact.
+  wasm-opt -Os "${WASM_OPT_FLAGS[@]}" "$wasm" -o "$wasm.opt"
+  [ -s "$wasm.opt" ] ||
+    { echo "contract-build: wasm-opt produced no output for $dir." >&2
+      echo "contract-build: it exits 0 and writes nothing when a feature flag is wrong." >&2
+      rm -f "$wasm.opt"; exit 1; }
+  after=$(wc -c < "$wasm.opt" | tr -d ' ')
+  [ "$after" -lt "$before" ] ||
+    { echo "contract-build: wasm-opt did not shrink $dir ($before -> $after bytes)." >&2
+      echo "contract-build: that is not an optimisation; something is wrong with the flags." >&2
+      rm -f "$wasm.opt"; exit 1; }
+  mv "$wasm.opt" "$wasm"
+  echo "build/$out.wasm wasm-opt -Os: $before -> $after bytes ($(( (before - after) * 1000 / before ))‰ smaller), binaryen $got" >&2
+fi
+
 echo "build/$out.wasm $(wc -c < "$wasm" | tr -d ' ') bytes sha256=$(shasum -a 256 "$wasm" | cut -c1-16)"

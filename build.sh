@@ -41,6 +41,12 @@ out=build/hashes.toml
   echo "# Read this file. Never gate on it: it is a record of a build, and a gate"
   echo "# a hash table can satisfy is a gate anyone can edit green."
   echo "rev   = \"$rev\""
+  # The post-processor is part of what made these bytes. A reader comparing a
+  # hash against this table with a different binaryen installed would otherwise
+  # have no way to know why it does not match.
+  if command -v wasm-opt >/dev/null 2>&1; then
+    echo "wasmopt = \"$(wasm-opt --version 2>&1 | head -1) -Os\""
+  fi
   echo "built = \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\""
   echo
   echo "[code]"

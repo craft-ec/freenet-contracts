@@ -90,3 +90,77 @@ function validate(path, params, state) {
 }
 
 module.exports = { validate, EMPTY_RELATED };
+
+// ---------------------------------------------------------------------------
+// The other three doors.
+//
+// `validate_state` answers accept/refuse, so a differential over it compares a
+// one-bit verdict. The other three RETURN BYTES, and for those the strictly
+// stronger comparison is the bytes themselves: two builds that produce
+// different summaries, deltas or updated states have changed behaviour even
+// when both "succeed". So these return `kind:sha256(payload)` and any
+// difference at all is a disagreement.
+const crypto = require('crypto');
+
+// bincode: a Vec's length is a u64, a Cow<[u8]> is a u64 length then the bytes,
+// and an enum's discriminant is a u32.
+function u64(n) { const b = Buffer.alloc(8); b.writeBigUInt64LE(BigInt(n)); return b; }
+function u32(n) { const b = Buffer.alloc(4); b.writeUInt32LE(n); return b; }
+function bytes(b) { return Buffer.concat([u64(b.length), Buffer.from(b)]); }
+
+/// `Vec<UpdateData>` holding one `UpdateData::State(state)` — the full-state
+/// update, which every one of these contracts accepts as an update shape.
+function updateFromState(state) {
+  return Buffer.concat([u64(1), u32(0), bytes(state)]);
+}
+/// `StateSummary` as `get_state_delta` wants it.
+function summaryArg(summary) { return bytes(summary); }
+
+const KIND = { 0: 'validate', 1: 'validate-delta', 2: 'update', 3: 'summarize', 4: 'delta' };
+
+function callDoor(path, door, args) {
+  let m;
+  try { m = load(path); } catch (e) { return `loadfail:${e.message}`; }
+  try {
+    const ptrs = args.map(a => BigInt(putBuf(m, a)));
+    const res = Number(m.w[door](...ptrs));
+    const dv = m.mem();
+    const ptr = Number(dv.getBigInt64(res + 0, true));
+    const kind = dv.getInt32(res + 8, true);
+    const size = dv.getUint32(res + 12, true);
+    if (m.refills.n > 0) return `refilled=${m.refills.n}`;
+    const buf = Buffer.from(m.bytes().slice(ptr, ptr + size));
+    // The payload's first u32 is the Result discriminant: 0 Ok, 1 Err. Both are
+    // legitimate answers and both must match between builds, so the tag is kept
+    // and the rest is hashed.
+    const tag = buf.length >= 4 ? buf.readUInt32LE(0) : -1;
+    return `${KIND[kind] ?? 'kind' + kind}:${tag === 0 ? 'ok' : tag === 1 ? 'err' : '?'}:` +
+           crypto.createHash('sha256').update(buf).digest('hex').slice(0, 16);
+  } catch (e) {
+    return `trap:${String(e.message).slice(0, 60)}`;
+  }
+}
+
+/// All four doors for one (params, state), as a map of door -> verdict.
+function allDoors(path, params, state) {
+  const out = { validate_state: validate(path, params, state) };
+  out.summarize_state = callDoor(path, 'summarize_state', [params, state]);
+  out.update_state = callDoor(path, 'update_state', [params, state, updateFromState(state)]);
+  // The summary a delta is asked for is the one this very module produced, so
+  // the input is always a summary the contract itself considers well formed.
+  let summary = Buffer.alloc(0);
+  try {
+    const m = load(path);
+    const p = putBuf(m, params), s = putBuf(m, state);
+    const res = Number(m.w.summarize_state(BigInt(p), BigInt(s)));
+    const dv = m.mem();
+    const sp = Number(dv.getBigInt64(res, true)), sz = dv.getUint32(res + 12, true);
+    const b = Buffer.from(m.bytes().slice(sp, sp + sz));
+    if (b.length >= 12 && b.readUInt32LE(0) === 0) summary = b.slice(12, 12 + Number(b.readBigUInt64LE(4)));
+  } catch { /* an unsummarisable state gets an empty summary, which is still a case */ }
+  out.get_state_delta = callDoor(path, 'get_state_delta', [params, state, summaryArg(summary)]);
+  return out;
+}
+
+module.exports.callDoor = callDoor;
+module.exports.allDoors = allDoors;

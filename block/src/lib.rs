@@ -70,9 +70,24 @@ pub const MAX_STATE: usize = 1 + pack::MAX_PACK;
 pub fn max_body(kind: u8) -> usize {
     match kind {
         kind::PACK => pack::MAX_PACK,
+        kind::PARITY => MAX_PARITY,
         _ => MAX_BODY,
     }
 }
+
+/// The largest a parity block can be, DERIVED from what a coded symbol is
+/// rather than written as a number.
+///
+/// A group's symbols are `len:u32 LE ‖ (kind ‖ body)`, and a parity symbol is
+/// as long as the longest of them, so the largest member the format allows —
+/// a block at `MAX_BODY` — gives parity five bytes larger than any data block.
+/// Without a per-kind limit that parity could never be stored.
+///
+/// It is a CEILING, not the reachable maximum: a leaf's members are referenced
+/// values bounded by the tree's `MAX_VALUE` and a branch's are nodes bounded by
+/// `MAX_NODE`, so the largest symbol anything can actually produce is smaller.
+/// A loose ceiling on a kind whose contents cannot be checked costs nothing.
+pub const MAX_PARITY: usize = 4 + 1 + MAX_BODY;
 
 /// Block kinds. Well-formedness per kind is added as each format lands.
 ///
@@ -139,7 +154,19 @@ fn well_formed(kind: u8, body: &[u8]) -> bool {
         // MEANT to be arbitrary: it is the value blob, and its bounds are its
         // length and its hash.
         kind::RAW => true,
-        // Reserved, not landed, and therefore REFUSED — including the four
+        // A parity block's body is a coded symbol: a GF(2⁸) combination of its
+        // group's symbols, each `len:u32 LE ‖ (kind ‖ body)`. So its first four
+        // bytes are a FIELD ELEMENT, not a length — reading them as one would
+        // refuse honest parity. Its contents cannot be checked without the
+        // group (8+ related fetches per validation), so the rule is its LENGTH
+        // and nothing else, and the bound above is what enforces it.
+        //
+        // **Empty is legal.** Parity is stored with its trailing zeros
+        // trimmed, so a group whose combination cancels entirely trims to
+        // nothing — reachable deliberately once a group has four members. A
+        // rule that refused an empty body would refuse real parity.
+        kind::PARITY => true,
+        // Reserved, not landed, and therefore REFUSED — including the three
         // whose bytes are frozen. A kind that accepts any body is a second
         // `RAW` under another name, and once an epoch is released that is a
         // promise every host keeps whatever is labelled with it. Each begins
@@ -272,7 +299,8 @@ mod tests {
     }
 
     /// A branch pointing at that leaf, keyed by the leaf's smallest key.
-    fn branch_node() -> Vec<u8> {
+    /// A branch carrying `parity` ids, whatever number is asked for.
+    fn branch_with(parity: usize) -> Vec<u8> {
         let leaf = leaf_node();
         let agg = Node::parse(&leaf).unwrap().agg();
         let mut b = NodeBuilder::branch(1);
@@ -284,7 +312,19 @@ mod tests {
         .unwrap();
         b.push_child(b"k/zzz", [9u8; 32], Agg { count: 1, bytes: 8 })
             .unwrap();
+        for i in 0..parity {
+            b.push_parity([0x40 + i as u8; 32]).unwrap();
+        }
         b.finish().unwrap()
+    }
+
+    /// A VALID branch: `pcount` is a pure function of the entries now, so one
+    /// without the ids its entries require is not a node. Their CONTENTS are
+    /// not checked — that is the rule, not a shortcut here.
+    fn branch_node() -> Vec<u8> {
+        let probe = branch_with(0);
+        let want = freenet_prolly::parity::pcount_of(&Node::parse(&probe).unwrap());
+        branch_with(want)
     }
 
     /// Replace every occurrence of `a` with `b` and vice versa. Used to reorder
@@ -621,25 +661,46 @@ mod tests {
     /// A node can be well-formed and still not be a node this tree could have
     /// produced. One cut in the wrong place is refused, and the entries are
     /// intact — so the refusal is about the boundary, nothing else.
-    /// Parity is well-formed and refused, and the same node without it is kept —
-    /// so the refusal is about the parity, not about the node.
+    /// A node whose parity count is not what its entries require is refused —
+    /// `pcount` is a pure function of them now, so the host can check it
+    /// exactly, and the same node with the right count is kept.
     #[test]
-    fn a_node_carrying_parity_is_refused() {
+    fn a_node_carrying_the_wrong_parity_count_is_refused() {
         let with_parity = node_with_parity();
         let node = Node::parse(&with_parity).expect("parity is part of the format");
         assert_eq!(node.parity_count(), 2);
+        let want = freenet_prolly::parity::pcount_of(&node);
+        assert_ne!(want, 2, "the fixture must carry the WRONG count");
         assert_eq!(
             check_node(&node),
-            Err(BoundaryError::UnexpectedParity),
+            Err(BoundaryError::WrongParityCount(want, 2)),
             "the tree library must refuse it"
         );
         let s = encode(kind::TREE_NODE, &with_parity);
         assert_eq!(validate(params_of(&s), s), ValidateResult::Invalid);
 
-        // Control: the same branch with no parity is held.
-        let clean = branch_node();
-        assert_eq!(Node::parse(&clean).unwrap().parity_count(), 0);
-        let s = encode(kind::TREE_NODE, &clean);
+        // Control: the SAME branch with the count its entries require is held,
+        // so the refusal above is about the count and not about parity being
+        // rejected wholesale. Two children are one group, hence three ids.
+        let right = {
+            let leaf = leaf_node();
+            let agg = Node::parse(&leaf).unwrap().agg();
+            let mut b = NodeBuilder::branch(1);
+            b.push_child(
+                b"k/aaa",
+                freenet_prolly::block_id(kind::TREE_NODE, &leaf),
+                agg,
+            )
+            .unwrap();
+            b.push_child(b"k/zzz", [9u8; 32], Agg { count: 1, bytes: 8 })
+                .unwrap();
+            for i in 0..want {
+                b.push_parity([0x30 + i as u8; 32]).unwrap();
+            }
+            b.finish().unwrap()
+        };
+        assert_eq!(Node::parse(&right).unwrap().parity_count(), want);
+        let s = encode(kind::TREE_NODE, &right);
         assert_eq!(validate(params_of(&s), s), ValidateResult::Valid);
 
         // And the bytes are kept under a kind with no format yet, so the
@@ -1141,10 +1202,11 @@ mod reserved_kind_tests {
     use super::*;
 
     /// The kinds whose bytes are reserved but whose formats have not landed.
-    const NOT_LANDED: [(&str, u8); 4] = [
+    /// `PARITY` is no longer here: its rule landed with the parity design, so
+    /// it validates (by length) rather than being refused.
+    const NOT_LANDED: [(&str, u8); 3] = [
         ("MEDIA_CHUNK", kind::MEDIA_CHUNK),
         ("FRAGMENT", kind::FRAGMENT),
-        ("PARITY", kind::PARITY),
         ("SCHEMA", kind::SCHEMA),
     ];
 
@@ -1220,5 +1282,109 @@ mod reserved_kind_tests {
                 "{name} must be refused by well_formed itself"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod parity_kind_tests {
+    use super::tests::*;
+    use super::*;
+
+    /// `MAX_PARITY` is derived from the symbol definition, so if either moves
+    /// this fails at compile time rather than a parity block becoming
+    /// unstorable at run time.
+    const _: () = assert!(MAX_PARITY == 4 + 1 + MAX_BODY);
+    const _: () = assert!(MAX_PARITY > MAX_BODY);
+
+    fn accepted(state: &[u8]) -> bool {
+        let p = params_of(state);
+        let v = validate(p.clone(), state.to_vec()) == ValidateResult::Valid;
+        assert_eq!(
+            v,
+            update(p, Vec::new(), vec![state.to_vec()]) == state,
+            "validate and update disagree"
+        );
+        v
+    }
+
+    /// **A random byte string of plausible length is ACCEPTED.**
+    ///
+    /// This is the test that matters, and it exists because the natural
+    /// instinct is to tighten this rule into something stricter — the author's
+    /// first proposal was "the leading u32 is at most len − 4", which would
+    /// have refused almost every real parity block, since those four bytes are
+    /// a field element and not a length. A rule that cannot be checked must
+    /// not pretend to be.
+    #[test]
+    fn any_byte_string_within_the_bound_is_accepted_as_parity() {
+        let mut x = 0x243f_6a88_85a3_08d3u64;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for len in [
+            0usize,
+            1,
+            3,
+            4,
+            5,
+            64,
+            4096,
+            MAX_BODY,
+            MAX_BODY + 4,
+            MAX_PARITY,
+        ] {
+            let body: Vec<u8> = (0..len).map(|_| next() as u8).collect();
+            assert!(
+                accepted(&encode(kind::PARITY, &body)),
+                "a {len}-byte parity body was refused"
+            );
+        }
+        // One byte past the ceiling is refused — so the acceptances above are
+        // a bound and not the absence of one.
+        assert!(!accepted(&encode(kind::PARITY, &vec![7u8; MAX_PARITY + 1])));
+    }
+
+    /// Empty parity is legal, and the reason is in the format: parity is stored
+    /// with trailing zeros trimmed, so a group whose combination cancels
+    /// entirely trims to nothing.
+    #[test]
+    fn empty_parity_is_legal() {
+        assert!(accepted(&encode(kind::PARITY, b"")));
+        // And it is a real state, not a quirk of the empty-state path: an
+        // empty BLOCK (no kind byte at all) is a different thing.
+        assert!(accepted(&encode(kind::PARITY, &[0u8])));
+    }
+
+    /// A group holding a maximum-size member really does produce parity larger
+    /// than any data block — which is why the ceiling is per kind.
+    #[test]
+    fn parity_over_a_max_size_member_exceeds_a_blocks_own_cap() {
+        use freenet_prolly::parity::{encode_group, symbol};
+        // The largest member the format allows: a block at MAX_BODY.
+        let biggest = vec![0xabu8; MAX_BODY];
+        let mut member = Vec::with_capacity(1 + biggest.len());
+        member.push(kind::RAW);
+        member.extend_from_slice(&biggest);
+        assert_eq!(
+            symbol(&member).len(),
+            MAX_PARITY,
+            "the symbol sets the ceiling"
+        );
+
+        // Two members so the parity cannot be a scalar multiple that trims.
+        let mut other = vec![kind::RAW];
+        other.extend_from_slice(&[0xcd; 32]);
+        let parity = encode_group(&[member, other]).expect("codeable");
+        assert!(
+            parity[0].len() > MAX_BODY,
+            "parity is {} B, which would fit a block's own cap",
+            parity[0].len()
+        );
+        assert!(accepted(&encode(kind::PARITY, &parity[0])));
+        // And it would NOT be storable under the old single cap.
+        assert!(parity[0].len() <= MAX_PARITY);
     }
 }

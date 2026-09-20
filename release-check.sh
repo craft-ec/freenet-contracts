@@ -210,15 +210,35 @@ verify() { # verify <toml> <epoch>
     local w="$wt/build/$k.wasm"
     row "contract.$k.sha256" "sha256:$(shasum -a 256 "$w" | cut -d' ' -f1)" "$(field "contract.$k.sha256")"
     row "contract.$k.bytes" "$(wc -c < "$w" | tr -d ' ')" "$(field "contract.$k.bytes")"
-    # Nothing may touch the wasm after cargo. This is what makes an empty
-    # postprocess.tools a CHECKED claim rather than an asserted one.
+    # What happened to the wasm between cargo and the artefact, CHECKED rather
+    # than asserted. With no post-processing the two must be identical; with
+    # post-processing recorded, re-running the recorded tool on cargo's output
+    # must reproduce the artefact byte for byte. Either way the row's claim
+    # about post-processing is tested, which is the point of the field.
     local crate cargo_out
     crate=$(python3 -c 'import sys,tomllib;print(tomllib.load(open(sys.argv[1],"rb"))["package"]["name"].replace("-","_"))' "$wt/$k/Cargo.toml")
     cargo_out="$wt/$k/target/wasm32-unknown-unknown/release/$crate.wasm"
-    if cmp -s "$w" "$cargo_out"; then
-      row "$k untouched after cargo" same same
+    if [ "$(field postprocess.tools.len)" = "0" ]; then
+      if cmp -s "$w" "$cargo_out"; then
+        row "$k untouched after cargo" same same
+      else
+        row "$k untouched after cargo" "differs from $crate.wasm" same
+      fi
     else
-      row "$k untouched after cargo" "differs from $crate.wasm" same
+      local redone="$wt/build/$k.redone.wasm"
+      if wasm-opt -Os --enable-bulk-memory-opt --enable-bulk-memory \
+           "$cargo_out" -o "$redone" 2>/dev/null && [ -s "$redone" ]; then
+        if cmp -s "$w" "$redone"; then
+          row "$k postprocess reproduces" same same
+        else
+          row "$k postprocess reproduces" "re-running wasm-opt gave different bytes" same
+        fi
+      else
+        # wasm-opt writes nothing and exits 0 on a flag it does not accept, so
+        # "could not check" has to be a FAILURE here rather than a skip.
+        row "$k postprocess reproduces" "wasm-opt produced no output" same
+      fi
+      rm -f "$redone"
     fi
   done
   if [ "$(field postprocess.tools.len)" = "0" ]; then
@@ -294,7 +314,14 @@ write_row() { # write_row <epoch> <tag> > the row
     echo "remap_expanded = $("$root/contract-build.sh" --flags "$first" | tr ' ' '\n' | grep -c remap-path-prefix)"
     echo
     echo "[epoch.postprocess]"
-    echo "tools = []"
+    # The wasm-opt release these bytes were produced with. It is as much a part
+    # of the epoch as the rustc that compiled them: a different binaryen gives
+    # different bytes, and these bytes are the network key.
+    if grep -q 'wasm-opt -Os' "$root/contract-build.sh" 2>/dev/null; then
+      echo "tools = [\"$(wasm-opt --version 2>&1 | head -1)\"]"
+    else
+      echo "tools = []"
+    fi
     for k in $kinds; do
       echo
       echo "[epoch.contract.$k]"

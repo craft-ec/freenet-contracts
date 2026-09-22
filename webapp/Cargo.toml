@@ -1,0 +1,38 @@
+[package]
+name = "craftec-webapp-contract"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Web app: an immutable, hash-keyed web container the node serves at /v1/contract/web/<key>/ (builder#104)."
+
+# Own workspace: own lockfile, so the wasm hash (= part of every app's address) is stable.
+[workspace]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+blake3 = { version = "1", default-features = false }
+
+# The contract no longer links freenet-stdlib: its entry points are the node's ABI by hand (`src/abi.rs`), and
+# its answers' bytes are `src/doors.rs`. The tests drive it through stdlib's own types and serializer, which is
+# what pins those bytes to the encoding the node decodes.
+[dev-dependencies]
+freenet-stdlib = { version = "0.10.0", features = ["contract"] }
+bincode = "1"
+serde = "1"
+
+[features]
+default = ["freenet-main-contract"]
+freenet-main-contract = []
+# The test helpers (a container builder), for the vectors crate.
+testing = []
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+debug = false

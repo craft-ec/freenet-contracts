@@ -217,6 +217,57 @@ fn block_cases() -> Vec<Case> {
 }
 
 
+/// The web container (builder#104): content-addressed, framed as the node serves it.
+fn webapp_cases() -> Vec<Case> {
+    use craftec_webapp_contract::{check, encode, MAX_METADATA};
+    let key = |st: &[u8]| blake3::hash(st).as_bytes().to_vec();
+    let accepted: Vec<(&str, Vec<u8>, Vec<u8>)> = vec![
+        ("no-metadata-one-byte-web", Vec::new(), vec![1]),
+        ("json-metadata", br#"{"app":"notes"}"#.to_vec(), vec![2; 100]),
+        ("metadata-at-bound", vec![b'm'; MAX_METADATA], vec![3]),
+        ("web-4k", Vec::new(), vec![4; 4096]),
+        ("web-64k", b"m".to_vec(), vec![5; 65_536]),
+        ("web-256k", b"m".to_vec(), (0..262_144u32).map(|i| (i % 251) as u8).collect()),
+        ("xz-magic-web", b"{}".to_vec(), [&[0xFD, b'7', b'z', b'X', b'Z', 0][..], &[0u8; 58]].concat()),
+        ("binary-metadata", vec![0, 255, 0, 255], vec![6; 17]),
+    ];
+    let mut out = Vec::new();
+    for (name, meta, web) in accepted {
+        let state = encode(&meta, &web);
+        let params = key(&state);
+        declared_accept(name, check(&params, &state));
+        out.push(Case { contract: "webapp", name: name.into(), params, state, expect: true });
+    }
+    // Framing defects UNDER THEIR OWN HASH, so the hash is not what refuses them.
+    let good = encode(b"m", &[7; 32]);
+    let mut trailing = good.clone();
+    trailing.push(0);
+    let mut lying = good.clone();
+    lying[..8].copy_from_slice(&5000u64.to_be_bytes());
+    for (name, state) in [
+        ("trailing-byte", trailing),
+        ("metadata-length-lies", lying),
+        ("metadata-over-bound", encode(&vec![b'm'; MAX_METADATA + 1], b"w")),
+        ("empty-web", encode(b"m", b"")),
+        ("web-shorter-than-said", good[..good.len() - 1].to_vec()),
+    ] {
+        let params = key(&state);
+        out.push(Case { contract: "webapp", name: name.into(), params, state, expect: false });
+    }
+    let verdict = |p: &[u8], st: &[u8]| st.is_empty() || check(p, st);
+    let base: Vec<Case> = out.iter().filter(|c| c.expect).map(|c| Case {
+        contract: c.contract,
+        name: c.name.clone(),
+        params: c.params.clone(),
+        state: c.state.clone(),
+        expect: c.expect,
+    }).collect();
+    for b in &base {
+        out.extend(derived("webapp", b, &verdict));
+    }
+    out
+}
+
 /// The three contracts whose `validate_state` is `read(params, state).is_some()`.
 ///
 /// One builder each, because the only thing that differs is how an ACCEPTED
@@ -353,6 +404,7 @@ fn main() {
     std::fs::create_dir_all(&dir).unwrap();
     let mut all = Vec::new();
     all.extend(block_cases());
+    all.extend(webapp_cases());
     all.extend(bag_cases());
     all.extend(register_cases());
     all.extend(set_cases());
@@ -382,7 +434,7 @@ fn main() {
     const MIN_ACCEPTED: usize = 8;
     const MIN_REFUSED: usize = 20;
     let mut short = Vec::new();
-    for contract in ["block", "bag", "register", "set"] {
+    for contract in ["block", "bag", "register", "set", "webapp"] {
         let n = all.iter().filter(|c| c.contract == contract).count();
         let acc = all
             .iter()

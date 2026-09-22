@@ -9,6 +9,7 @@ description = "Writes the frozen accept/refuse corpus the wasm-opt differential 
 # No default features: the wasm entry points are not wanted here, only the
 # plain functions and the test helpers that build states the contracts accept.
 craftec-block-contract = { path = "../block", default-features = false, features = ["testing"] }
+craftec-webapp-contract = { path = "../webapp", default-features = false, features = ["testing"] }
 craftec-register-contract = { path = "../register", default-features = false, features = ["testing"] }
 craftec-bag-contract = { path = "../bag", default-features = false, features = ["testing"] }
 craftec-set-contract = { path = "../set", default-features = false, features = ["testing"] }

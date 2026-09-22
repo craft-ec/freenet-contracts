@@ -36,10 +36,10 @@ mkdir -p "$work/builds" "$work/corpus"
 # The reference is the SAME compile with the optimiser skipped — not the
 # shipped artefact, which is now -Os. Comparing -Os against itself would be a
 # gate that passes by construction.
-for c in bag block register set; do cp "build/$c.wasm" "$work/shipped-$c.wasm"; done
-trap 'for c in bag block register set; do [ -f "$work/shipped-$c.wasm" ] && cp "$work/shipped-$c.wasm" "build/$c.wasm"; done; rm -rf "$work"' EXIT
+for c in bag block register set webapp; do cp "build/$c.wasm" "$work/shipped-$c.wasm"; done
+trap 'for c in bag block register set webapp; do [ -f "$work/shipped-$c.wasm" ] && cp "$work/shipped-$c.wasm" "build/$c.wasm"; done; rm -rf "$work"' EXIT
 CONTRACT_BUILD_NO_WASM_OPT=1 ./build.sh >/dev/null
-for c in bag block register set; do
+for c in bag block register set webapp; do
   cp "build/$c.wasm" "$work/builds/$c.as-built.wasm"
   a=$(wc -c < "$work/builds/$c.as-built.wasm"); b=$(wc -c < "$work/shipped-$c.wasm")
   [ "$a" -gt "$b" ] || { echo "wasmopt-check: the reference build of $c is not larger than the shipped one ($a vs $b) — the skip switch did nothing" >&2; exit 1; }

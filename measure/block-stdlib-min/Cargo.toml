@@ -1,0 +1,27 @@
+[package]
+name = "block-stdlib-min"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "MEASUREMENT ONLY: block-min's logic through freenet-stdlib's #[contract] -- the stdlib's own floor."
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+freenet-stdlib = { version = "0.10.0", features = ["contract"] }
+blake3 = { version = "1", default-features = false }
+
+[features]
+default = ["freenet-main-contract"]
+freenet-main-contract = []
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+debug = false

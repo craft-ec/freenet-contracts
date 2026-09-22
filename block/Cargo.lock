@@ -165,9 +165,11 @@ dependencies = [
 name = "craftec-block-contract"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "blake3",
  "freenet-prolly",
  "freenet-stdlib",
+ "serde",
 ]
 
 [[package]]

@@ -7,9 +7,17 @@
 //!          changes. Exactly one byte string hashes to `params`, so this is
 //!          trivially commutative, associative and idempotent.
 
-use freenet_stdlib::prelude::*;
-
+#[cfg(all(target_family = "wasm", feature = "freenet-main-contract"))]
+mod abi;
+pub mod doors;
 pub mod pack;
+
+// The tests drive the contract through freenet-stdlib's own types (`Block` below), so every door's bytes are
+// decoded -- and re-encoded -- by the serializer the node uses.
+#[cfg(test)]
+use freenet_stdlib::prelude::*;
+#[cfg(test)]
+pub use stdlib_shape::Block;
 
 /// Work a state can ask a host for, counted so the price of REFUSING one can be
 /// asserted rather than argued.
@@ -199,68 +207,64 @@ pub fn check(params: &[u8], state: &[u8]) -> bool {
         && well_formed(state[0], &state[1..])
 }
 
-pub struct Block;
+/// The four doors behind freenet-stdlib's `ContractInterface`, for the tests only: each door's BYTES are decoded as
+/// the stdlib type the node decodes them as, and must re-encode to exactly those bytes. So every test below is also
+/// a check of the hand-written encoding in [`doors`].
+#[cfg(test)]
+mod stdlib_shape {
+    use freenet_stdlib::prelude::*;
 
-#[contract]
-impl ContractInterface for Block {
-    fn validate_state(
-        parameters: Parameters<'static>,
-        state: State<'static>,
-        _related: RelatedContracts<'static>,
-    ) -> Result<ValidateResult, ContractError> {
-        let s = state.as_ref();
-        Ok(if s.is_empty() || check(parameters.as_ref(), s) {
-            ValidateResult::Valid
-        } else {
-            ValidateResult::Invalid
-        })
+    pub struct Block;
+
+    /// Decode a door's answer, and require it to be the stdlib's own encoding of what it decodes to.
+    fn read<'a, T: serde::Deserialize<'a> + serde::Serialize>(bytes: &'a [u8]) -> T {
+        let v: T = bincode::deserialize(bytes).expect("a door's bytes decode as the stdlib type");
+        assert_eq!(
+            bincode::serialize(&v).expect("re-encodes"),
+            bytes,
+            "a door's bytes are not the stdlib encoding of what they decode to"
+        );
+        v
     }
 
-    fn update_state(
-        parameters: Parameters<'static>,
-        state: State<'static>,
-        data: Vec<UpdateData<'static>>,
-    ) -> Result<UpdateModification<'static>, ContractError> {
-        if !state.as_ref().is_empty() {
-            return Ok(UpdateModification::valid(state));
+    impl ContractInterface for Block {
+        fn validate_state(
+            p: Parameters<'static>,
+            s: State<'static>,
+            _: RelatedContracts<'static>,
+        ) -> Result<ValidateResult, ContractError> {
+            read(crate::doors::validate(p.as_ref(), s.as_ref()))
         }
-        let params = parameters.as_ref();
-        for item in data {
-            let candidates: [Option<&[u8]>; 2] = match &item {
-                UpdateData::State(s) => [Some(s.as_ref()), None],
-                UpdateData::Delta(d) => [Some(d.as_ref()), None],
-                UpdateData::StateAndDelta { state, delta } => {
-                    [Some(state.as_ref()), Some(delta.as_ref())]
-                }
-                _ => [None, None],
-            };
-            for bytes in candidates.into_iter().flatten() {
-                if check(params, bytes) {
-                    return Ok(UpdateModification::valid(State::from(bytes.to_vec())));
-                }
-            }
-        }
-        Ok(UpdateModification::valid(state))
-    }
 
-    fn summarize_state(
-        _parameters: Parameters<'static>,
-        state: State<'static>,
-    ) -> Result<StateSummary<'static>, ContractError> {
-        Ok(StateSummary::from(vec![u8::from(
-            !state.as_ref().is_empty(),
-        )]))
-    }
-
-    fn get_state_delta(
-        _parameters: Parameters<'static>,
-        state: State<'static>,
-        summary: StateSummary<'static>,
-    ) -> Result<StateDelta<'static>, ContractError> {
-        if summary.as_ref() == [1] || state.as_ref().is_empty() {
-            return Ok(StateDelta::from(Vec::new()));
+        fn update_state(
+            p: Parameters<'static>,
+            s: State<'static>,
+            data: Vec<UpdateData<'static>>,
+        ) -> Result<UpdateModification<'static>, ContractError> {
+            let wire = bincode::serialize(&data).expect("updates encode");
+            let bytes = crate::doors::update(p.as_ref(), s.as_ref(), &wire);
+            let r: Result<UpdateModification<'_>, ContractError> = read(&bytes);
+            r.map(|m| m.into_owned())
         }
-        Ok(StateDelta::from(state.as_ref().to_vec()))
+
+        fn summarize_state(
+            _: Parameters<'static>,
+            s: State<'static>,
+        ) -> Result<StateSummary<'static>, ContractError> {
+            let bytes = crate::doors::summarize(s.as_ref());
+            let r: Result<StateSummary<'_>, ContractError> = read(&bytes);
+            r.map(|x| StateSummary::from(x.as_ref().to_vec()))
+        }
+
+        fn get_state_delta(
+            _: Parameters<'static>,
+            s: State<'static>,
+            summary: StateSummary<'static>,
+        ) -> Result<StateDelta<'static>, ContractError> {
+            let bytes = crate::doors::delta(s.as_ref(), summary.as_ref());
+            let r: Result<StateDelta<'_>, ContractError> = read(&bytes);
+            r.map(|x| StateDelta::from(x.as_ref().to_vec()))
+        }
     }
 }
 

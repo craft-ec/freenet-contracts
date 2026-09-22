@@ -8,8 +8,12 @@
 //   __frnt__initiate_buffer(capacity: u32) -> i64   ptr to a BufferBuilder
 //   BufferBuilder, #[repr(C)] on wasm32:
 //     start: i64 @0, capacity: u32 @8, (pad), last_read: i64 @16, last_write: i64 @24
-//   Each argument is a STREAMING buffer: the data is [total_len: u32 LE][payload],
-//   the contract reads from offset 4, and `last_write` holds 4 + payload.len().
+//   The FRAMING is the node's choice, made from the module's imports exactly as freenet 0.2.136 makes it
+//   (`module_has_streaming_io`: any import from `freenet_contract_io`):
+//   - STREAMING (a stdlib-built contract): the data is [total_len: u32 LE][payload], the contract reads from
+//     offset 4, and `last_write` holds 4 + payload.len();
+//   - LEGACY (no such import: the hand-written ABI, block/src/abi.rs): the payload alone, and `last_write`
+//     holds payload.len().
 //   Getting this wrong is silent — every call returns a bincode "unexpected end
 //   of file" whatever the payload is, because the length header is read as the
 //   payload's first four bytes.
@@ -37,16 +41,22 @@ function load(path) {
       return 0;
     };
   }
+  const streaming = WebAssembly.Module.imports(mod).some(i => i.module === 'freenet_contract_io');
   const inst = new WebAssembly.Instance(mod, imports);
-  return { w: inst.exports, refills,
+  return { w: inst.exports, refills, streaming,
            mem: () => new DataView(inst.exports.memory.buffer),
            bytes: () => new Uint8Array(inst.exports.memory.buffer) };
 }
 
 function putBuf(m, data) {
-  const framed = Buffer.alloc(4 + data.length);
-  framed.writeUInt32LE(data.length, 0);
-  Buffer.from(data).copy(framed, 4);
+  let framed;
+  if (m.streaming) {
+    framed = Buffer.alloc(4 + data.length);
+    framed.writeUInt32LE(data.length, 0);
+    Buffer.from(data).copy(framed, 4);
+  } else {
+    framed = Buffer.from(data);
+  }
   const ptr = Number(m.w.__frnt__initiate_buffer(framed.length));
   const dv = m.mem();
   const start = Number(dv.getBigInt64(ptr + 0, true));

@@ -178,11 +178,11 @@ fn well_formed(kind: u8, body: &[u8]) -> bool {
         // whose bytes are frozen. A kind that accepts any body is a second
         // `RAW` under another name, and once an epoch is released that is a
         // promise every host keeps whatever is labelled with it. Each begins
-        // validating when its rule lands: `PARITY` with the parity rule
-        // (freenet-prolly#19, phase 4), `MEDIA_CHUNK` and `FRAGMENT` with files
-        // and media (phase 5, the same Block-code epoch as parity), `SCHEMA`
-        // with schemas. The BYTES stay frozen and reserved meanwhile — what is
-        // refused is the content, never the number.
+        // validating when its rule lands, and that is a new Block-code epoch:
+        // `MEDIA_CHUNK` and `FRAGMENT` with files and media (phase 5),
+        // `SCHEMA` with schemas. (`PARITY` left this list when its rule landed,
+        // #29, and was released in epoch 1.) The BYTES stay frozen and reserved
+        // meanwhile — what is refused is the content, never the number.
         _ => false,
     }
 }

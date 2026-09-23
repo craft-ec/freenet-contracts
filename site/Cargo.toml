@@ -1,0 +1,48 @@
+[package]
+name = "craftec-site-contract"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Site: a publisher's web app at ONE stable address, updated in place by the identity's Register authority (builder#117)."
+
+# Own workspace: own lockfile, so the wasm hash (= part of every site's address) is stable.
+[workspace]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+blake3 = { version = "1", default-features = false }
+# The Register's authority scheme, used as a LIBRARY: its params, its record
+# encoding and verification, and its merge. `default-features = false` so none
+# of the Register's own contract entry points are linked into this wasm. The
+# Register's code is not edited: any edit to it moves register.wasm's hash,
+# which re-keys every head (measured on builder#117).
+#
+# By GIT REV of this repository, not by path. A path dependency outside this
+# crate's own workspace is identified to cargo by its ABSOLUTE path, which
+# enters the crate's metadata hash and so the order of the generated code:
+# site.wasm came out different in every checkout directory (hash-gate b1).
+# A git dependency is identified by URL and revision, and the revision is the
+# released Register's source exactly (320de71, the last change to register/).
+craftec-register-contract = { git = "https://github.com/craft-ec/freenet-contracts", rev = "320de71", default-features = false }
+
+[dev-dependencies]
+freenet-stdlib = { version = "0.10.0", features = ["contract"] }
+bincode = "1"
+serde = "1"
+craftec-register-contract = { git = "https://github.com/craft-ec/freenet-contracts", rev = "320de71", default-features = false, features = ["testing"] }
+ed25519-dalek = { version = "=2.2.0", default-features = false }
+
+[features]
+default = ["freenet-main-contract"]
+freenet-main-contract = []
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+debug = false

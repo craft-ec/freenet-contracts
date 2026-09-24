@@ -15,7 +15,7 @@ craftec-block-contract = { path = "../block", default-features = false }
 craftec-register-contract = { path = "../register", default-features = false, features = ["testing"] }
 craftec-bag-contract = { path = "../bag", default-features = false, features = ["testing"] }
 craftec-set-contract = { path = "../set", default-features = false, features = ["testing"] }
-freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "9764b86" }
+freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "17d67d8" }
 
 # The contracts' profile, field for field. check-wasm.sh times this crate
 # with the flags a contract ships with precisely so the number is about the

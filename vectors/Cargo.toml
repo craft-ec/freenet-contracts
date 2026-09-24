@@ -13,7 +13,7 @@ craftec-webapp-contract = { path = "../webapp", default-features = false, featur
 craftec-register-contract = { path = "../register", default-features = false, features = ["testing"] }
 craftec-bag-contract = { path = "../bag", default-features = false, features = ["testing"] }
 craftec-set-contract = { path = "../set", default-features = false, features = ["testing"] }
-freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "9764b86" }
+freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "17d67d8" }
 blake3 = "1"
 
 [workspace]

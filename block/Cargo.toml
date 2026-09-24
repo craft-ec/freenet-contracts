@@ -17,7 +17,7 @@ blake3 = { version = "1", default-features = false }
 # Pinned by revision, not by path: the wasm must build byte-identically for
 # anyone who checks this repo out. Bump the rev deliberately — it changes the
 # bytes a tree-node Block is allowed to hold, hence the contract's own hash.
-freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "384d86e" }
+freenet-prolly = { git = "https://github.com/craft-ec/freenet-prolly", rev = "17d67d8" }
 
 # The contract no longer links freenet-stdlib: its entry points are the node's ABI by hand (`src/abi.rs`), and
 # its answers' bytes are `src/doors.rs`. The tests drive it through stdlib's own types and serializer, which is

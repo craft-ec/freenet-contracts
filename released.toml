@@ -36,7 +36,10 @@
 
 # EPOCH 1 is the first release (phase 3, 2026-09-22, v0.1.0: the Block
 # contract's hand-written ABI, #44). EPOCH 2 (v0.2.0) adds `webapp`
-# (builder#104, #47); the other four are byte-identical to epoch 1. Before it the table was empty on purpose:
+# (builder#104, #47); the other four are byte-identical to epoch 1. EPOCH 3 (v0.3.0) is
+# sdk#321's format epoch: `block` moves (freenet-prolly 17d67d8, the tree's parity per group 8 at MIN_GROUP 21,
+# #54), `site` is released for the first time (builder#117's site contract), the other four are byte-identical to
+# epoch 2. Before it the table was empty on purpose:
 # no epoch had been released and no data was kept under any code, which is why
 # #16 and #44 could change hashes for free. From epoch 1 on that is no longer
 # free -- a changed hash is a new epoch, added below by the procedure above.
@@ -269,6 +272,84 @@ bytes       = 124690
 lock_sha256 = "sha256:a4b764ea6f692cfbac5cd12a2d92357d07465fc07974d380fbbd339863ef1dec"
 sha256      = "sha256:f0d7ea30350e4c1115b67f432eb7da03b66adf2811143a04848c35507280ddd2"
 bytes       = 148519
+
+[epoch.contract.webapp]
+lock_sha256 = "sha256:664507ebc233e1042925009e1807c6c60e01b0a913519382bcee7fd7692b259a"
+sha256      = "sha256:4798db7ac8a7560dfe65350cb0b2e6ff93ddf66a9ad26f5b55ec2ceea0d216a9"
+bytes       = 30476
+
+[[epoch]]
+number   = 3
+released = "2026-09-24"
+tag      = "v0.3.0"
+builder  = "onlyabrak"
+
+[epoch.source]
+repo   = "https://github.com/craft-ec/freenet-contracts.git"
+commit = "e1a5c4e8d28701d6a6f1ee8d28e92e33ccde338c"
+dirty  = false
+
+[epoch.toolchain]
+channel   = "1.97.1"
+rustc     = "rustc 1.97.1 (8bab26f4f 2026-07-14)"
+llvm      = "22.1.6"
+cargo     = "cargo 1.97.1 (c980f4866 2026-06-30)"
+target    = "wasm32-unknown-unknown"
+bootstrap = true
+
+[epoch.profile]
+opt_level     = "z"
+lto           = true
+codegen_units = 1
+panic         = "abort"
+strip         = true
+debug         = false
+
+[epoch.flags]
+location_detail = "none"
+remap = [
+  "$RUSTUP_HOME=/rustup",
+  "$CARGO_HOME=/cargo",
+  "$REPO=/contracts",
+  "$REPO/<contract>=/<contract>",
+  "$CARGO_HOME/registry/src/<index>=/registry",
+  "$CARGO_HOME/git/checkouts/<pkg>-<hash>/<rev>=/dep/<pkg>",
+]
+remap_expanded = 35
+
+[epoch.postprocess]
+tools = ["wasm-opt version 125"]
+
+[epoch.contract.bag]
+lock_sha256 = "sha256:e9d45a9dfa636c45569093ba686603cb7193dfb8a55b1e62d505aabd55577859"
+sha256      = "sha256:18ec019f1ce96402384693751cffab5efc0467f5e14dbdadbf136fd525c8aa6f"
+bytes       = 111454
+
+[epoch.contract.block]
+lock_sha256 = "sha256:645915a6fd0569e37361e0ad74c1f31d7d573b9c75763a984ad06b0320280580"
+sha256      = "sha256:cd00e10f4e762175ed6e75cda10e05a1ffe36fd720691fd3341820cfa6f16e2d"
+bytes       = 40386
+
+[epoch.contract.block.git_deps]
+"freenet-prolly" = "17d67d84f29b346bee8e2795d874a5ac0c3b5ebe"
+
+[epoch.contract.register]
+lock_sha256 = "sha256:a82561446f55a1f3f1f47c97e6e98d5890b231789bd8d2c475a2e602c363c0bb"
+sha256      = "sha256:58f66b06f4f3acc106507b6515d2f31ca52e509b506cf5c8bac5b5e3d105693c"
+bytes       = 124690
+
+[epoch.contract.set]
+lock_sha256 = "sha256:a4b764ea6f692cfbac5cd12a2d92357d07465fc07974d380fbbd339863ef1dec"
+sha256      = "sha256:f0d7ea30350e4c1115b67f432eb7da03b66adf2811143a04848c35507280ddd2"
+bytes       = 148519
+
+[epoch.contract.site]
+lock_sha256 = "sha256:fc99f9133e5c47a7265610f720924476ebe2e99891a929e21a98706ec6494ea3"
+sha256      = "sha256:b5c48e35898a902bb7e4709a845075d97a58b51a9c293f473b4c3e7b761dfde4"
+bytes       = 63637
+
+[epoch.contract.site.git_deps]
+"craftec-register-contract" = "320de71598279741583052ad6be4e773f45425ab"
 
 [epoch.contract.webapp]
 lock_sha256 = "sha256:664507ebc233e1042925009e1807c6c60e01b0a913519382bcee7fd7692b259a"

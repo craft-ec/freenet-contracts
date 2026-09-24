@@ -388,6 +388,11 @@ impl Record {
 
     /// Returns the record and the bytes left over, since a state may hold
     /// evidence after it.
+    ///
+    /// TODO(next register epoch): parse the authority-free prefix through ONE
+    /// function shared with [`record_head`], which repeats it today only so
+    /// that this contract's code (and so register.wasm's hash) stays put;
+    /// `record_head_agrees_with_read` holds the two together until then.
     fn parse(b: &[u8], a: &Authority) -> Option<(Record, usize)> {
         let (&terminal, rest) = b.split_first()?;
         let (seq, rest) = rest.split_at_checked(8)?;
@@ -512,6 +517,49 @@ pub fn conflicts(x: &Signed, y: &Signed) -> bool {
 
 /// `"RG01" ‖ flags(1) ‖ record? ‖ evidence?`.
 ///
+/// A state's record as `(terminal, seq, value)`, WITHOUT the params: structure
+/// only -- the magic, the flags, and the record's authority-free prefix (the
+/// value comes before the signatures, whose count is the authority's).
+///
+/// For a reader that holds a state but not its params: a page reading a head it
+/// knows only by contract id, or the signer's own freshly signed record. **Safe
+/// only for a state a host already VALIDATED**: a node runs `validate_state` (the
+/// full `read`, every signature) before it stores or serves a state, so what a
+/// client is handed has been checked there -- and is never checked again here.
+/// Anything that must TRUST a state it did not get from a node calls [`crate::read`]
+/// with the params. `None` for no record, or a structure that is not one.
+///
+/// **LIBRARY ONLY** (`feature = "library"`, never the contract's): adding a
+/// function to the contract build moves register.wasm's hash, and that re-keys
+/// every Register (measured, #117). So this is compiled out of the wasm, and its
+/// prefix parse is kept beside `Record::parse`'s rather than shared with it,
+/// which would change the contract's code; `record_head_agrees_with_read` pins
+/// the two to each other, and closure-gate.sh pins the wasm's hash.
+///
+/// TODO(next register epoch): when the contract's code changes anyway, `Record::parse`
+/// and this share one prefix parse, and the repeat here goes.
+#[cfg(any(test, feature = "library"))]
+pub fn record_head(state: &[u8]) -> Option<(bool, u64, &[u8])> {
+    let rest = state.strip_prefix(MAGIC)?;
+    let (&flags, rest) = rest.split_first()?;
+    if flags & FLAG_RECORD == 0 || flags & !(FLAG_RECORD | FLAG_EVIDENCE) != 0 {
+        return None;
+    }
+    let (&terminal, rest) = rest.split_first()?;
+    let terminal = canonical_bool(terminal)?;
+    let (seq, rest) = rest.split_at_checked(8)?;
+    let (vlen, rest) = rest.split_at_checked(2)?;
+    let vlen = u16::from_le_bytes([vlen[0], vlen[1]]) as usize;
+    if vlen > MAX_VALUE || (terminal && vlen != TERMINAL_VALUE_LEN) {
+        return None;
+    }
+    Some((
+        terminal,
+        u64::from_le_bytes(seq.try_into().ok()?),
+        rest.get(..vlen)?,
+    ))
+}
+
 /// The empty register is the empty byte string, never `MAGIC ‖ 0` — otherwise
 /// "nothing here" would have two encodings.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -599,5 +647,75 @@ impl RegState {
             return None;
         }
         Some(state)
+    }
+}
+
+#[cfg(test)]
+mod record_head_tests {
+    use super::record_head;
+    use crate::testing::{keyset, World};
+    use crate::wire::Authority;
+
+    /// `record_head` (no params, structure only) and the crate's full `read` (params, every signature) agree on
+    /// `(terminal, seq, value)` for every valid state: mode 0 and a 2-of-3 quorum, with and without fork evidence.
+    #[test]
+    fn record_head_agrees_with_read() {
+        let (mut compared, mut with_evidence, mut quorum, mut single) = (0, 0, 0, 0);
+        for w in [keyset(1, 1, true), keyset(2, 3, false)] {
+            let mut states = w.sample_states();
+            // And explicitly: a record held beside PROOF OF A FORK (two signed decisions at one seq), the state a
+            // hand-written parser once refused (F56).
+            let a = w.record(false, 7, b"one head");
+            if let Some(b) = w.alternate(false, 7, b"another head") {
+                let mut s = w.state(a.clone());
+                s.evidence = Some(w.evidence_of(&a, &b));
+                states.push(s);
+            }
+            for s in states {
+                let bytes = w.encode(&s);
+                let (_, full) = crate::read(&w.params_bytes, &bytes)
+                    .expect("a sample state the crate itself reads");
+                let want = full
+                    .record
+                    .as_ref()
+                    .map(|r| (r.signed.terminal, r.signed.seq, r.value.clone()));
+                let got = record_head(&bytes).map(|(t, q, v)| (t, q, v.to_vec()));
+                assert_eq!(
+                    got,
+                    want,
+                    "record_head and read disagree on a state (evidence: {})",
+                    s.evidence.is_some()
+                );
+                compared += 1;
+                with_evidence += usize::from(s.evidence.is_some() && s.record.is_some());
+                quorum += usize::from(matches!(w.auth, Authority::Quorum { .. }));
+                single += usize::from(matches!(w.auth, Authority::One(_)));
+            }
+        }
+        println!("record_head vs read: {compared} states ({single} mode 0, {quorum} quorum), {with_evidence} with a record and fork evidence");
+        assert!(
+            single >= 3 && quorum >= 3 && with_evidence >= 2,
+            "not a real comparison: {single}/{quorum}/{with_evidence}"
+        );
+    }
+
+    /// THE CONTROL: a record_head that read the wrong field would fail above; and it refuses what is not a record.
+    #[test]
+    fn record_head_refuses_what_is_not_a_record() {
+        let w: World = keyset(1, 1, true);
+        let bytes = w.encode(&w.state(w.record(false, 3, b"v")));
+        assert!(record_head(&bytes).is_some());
+        assert_eq!(record_head(&[]), None, "the empty register has no record");
+        assert_eq!(
+            record_head(&bytes[..bytes.len().min(10)]),
+            None,
+            "a truncated state"
+        );
+        let mut bad = bytes.clone();
+        bad[0] = b'X';
+        assert_eq!(record_head(&bad), None, "a wrong magic");
+        let mut flags = bytes.clone();
+        flags[4] = 0b10; // evidence only, no record
+        assert_eq!(record_head(&flags), None, "a state with no record flag");
     }
 }

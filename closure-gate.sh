@@ -109,6 +109,24 @@ else
   row "register library closure" ok "$lib_n packages examined, no freenet-stdlib"
 fi
 
+# The CONTRACT's bytes are not moved by the library (sdk#364): register.wasm, built as the contract is (the default
+# features: `library` OFF), must be the released one. Adding a library function to the contract build was measured
+# to move the hash (#117), and a moved hash re-keys every Register. The expected hash is the LAST
+# [epoch.contract.register] in released.toml -- an intended change of the contract declares a new epoch there.
+want=$(awk '/^\[epoch\.contract\.register\]/{f=1} f && /^sha256/{gsub(/.*sha256:|"/,""); last=$0; f=0} END{print last}' released.toml)
+if [ -z "$want" ]; then
+  row "register.wasm = released" FAILED "no [epoch.contract.register] sha256 in released.toml"
+elif ! ./register/build.sh >/dev/null 2>&1; then
+  row "register.wasm = released" FAILED "register/build.sh failed"
+else
+  got=$(shasum -a 256 build/register.wasm | cut -d' ' -f1)
+  if [ "$got" = "$want" ]; then
+    row "register.wasm = released" ok "sha256 ${got:0:16} (library OFF), as released"
+  else
+    row "register.wasm = released" FAILED "sha256 ${got:0:16}, released ${want:0:16}: the contract's key would move"
+  fi
+fi
+
 echo
 [ "$checks" -gt 0 ] || { echo "closure-gate: 0 checks ran" >&2; exit 1; }
 if [ "$failures" -gt 0 ]; then
@@ -233,13 +251,38 @@ EOF2
     printf '%s\n' "$out" | sed 's/^/          /'
   fi
 
+  echo "== control 4: a register.wasm that is not the released one must make the gate FAIL =="
+  git -C "$root" show HEAD:register/Cargo.toml > "$work/repo/register/Cargo.toml"
+  # The released hash replaced by another: the built wasm (unchanged) no longer matches, exactly as a moved wasm
+  # would not match the unchanged released hash.
+  python3 - "$work/repo/released.toml" <<'EOF4'
+import sys, re
+p = sys.argv[1]
+s = open(p).read()
+i = s.rindex("[epoch.contract.register]")
+j = s.index("sha256      =", i)
+k = s.index("\n", j)
+s = s[:j] + 'sha256      = "sha256:' + "0" * 64 + '"' + s[k:]
+open(p, "w").write(s)
+EOF4
+  out=$( cd "$work/repo" && ./closure-gate.sh 2>&1 ) && rc=0 || rc=$?
+  c=$((c + 1))
+  if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q "register.wasm = released .*FAILED"; then
+    echo "  ok      the gate failed and named register.wasm = released"
+  else
+    f=$((f + 1))
+    echo "  FAILED  the gate did not fire (rc=$rc):"
+    printf '%s\n' "$out" | sed 's/^/          /'
+  fi
+
   echo
   if [ "$f" -gt 0 ]; then
     echo "self-test: $f of $c controls FAILED"
     exit 1
   fi
   echo "self-test: $c controls passed — the gate fires on a normal dependency,"
-  echo "           permits a dev-dependency, and fires on a register that links stdlib without its feature"
+  echo "           permits a dev-dependency, fires on a register that links stdlib without its feature,"
+  echo "           and fires on a register.wasm that is not the released one"
 }
 
 if [ "${1:-}" = --self-test ]; then

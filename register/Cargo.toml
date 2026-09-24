@@ -34,6 +34,10 @@ sha2 = "0.10"
 [features]
 default = ["freenet-main-contract"]
 freenet-main-contract = ["dep:freenet-stdlib"]
+# The LIBRARY's extras (craftworks-sdk#364): functions a client needs and the contract never calls, e.g.
+# `wire::record_head`. NEVER enabled by the contract build, because adding a function to the wasm moves its hash
+# and re-keys every Register; closure-gate.sh checks the hash with this OFF.
+library = []
 # Fixtures for the tests and for wasm-check. Off by default, so none of it is in
 # the contract's wasm.
 testing = []

@@ -388,6 +388,11 @@ impl Record {
 
     /// Returns the record and the bytes left over, since a state may hold
     /// evidence after it.
+    ///
+    /// TODO(next register epoch): parse the authority-free prefix through ONE
+    /// function shared with [`record_head`], which repeats it today only so
+    /// that this contract's code (and so register.wasm's hash) stays put;
+    /// `record_head_agrees_with_read` holds the two together until then.
     fn parse(b: &[u8], a: &Authority) -> Option<(Record, usize)> {
         let (&terminal, rest) = b.split_first()?;
         let (seq, rest) = rest.split_at_checked(8)?;
@@ -530,6 +535,9 @@ pub fn conflicts(x: &Signed, y: &Signed) -> bool {
 /// prefix parse is kept beside `Record::parse`'s rather than shared with it,
 /// which would change the contract's code; `record_head_agrees_with_read` pins
 /// the two to each other, and closure-gate.sh pins the wasm's hash.
+///
+/// TODO(next register epoch): when the contract's code changes anyway, `Record::parse`
+/// and this share one prefix parse, and the repeat here goes.
 #[cfg(any(test, feature = "library"))]
 pub fn record_head(state: &[u8]) -> Option<(bool, u64, &[u8])> {
     let rest = state.strip_prefix(MAGIC)?;

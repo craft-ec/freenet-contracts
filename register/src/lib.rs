@@ -17,6 +17,9 @@
 //! **The contract is neutral about consequences.** It proves a fork happened and
 //! keeps the proof; what to do about a forked register is the reader's policy.
 
+// The CONTRACT (`freenet-main-contract`, the default) and only it uses freenet-stdlib: with no default features this
+// crate is a plain library of read/parse/verify, with no client stack (closure-gate.sh).
+#[cfg(feature = "freenet-main-contract")]
 use freenet_stdlib::prelude::*;
 
 pub mod merge;
@@ -28,8 +31,12 @@ pub mod succ;
 pub mod testing;
 pub mod wire;
 
+// Used by the contract's merge path (and its tests and cost measures), not by the library's read/parse/verify.
+#[cfg(any(feature = "freenet-main-contract", test, feature = "testing"))]
 use merge::update;
-use wire::{Evidence, Params, RegState};
+#[cfg(any(feature = "freenet-main-contract", test, feature = "testing"))]
+use wire::Evidence;
+use wire::{Params, RegState};
 
 /// Largest state: a full value, a full 16-of-16 record, and evidence of the same
 /// size minus the values. Generous — the encodings are checked exactly.
@@ -65,6 +72,7 @@ pub fn read_unverified(params: &[u8], state: &[u8]) -> Option<(Params, RegState)
 /// hold different witnesses of one decision; if the summary read the witness
 /// they would see each other as out of date forever and re-send the state on
 /// every exchange, for a difference neither of them needs to resolve.
+#[cfg(any(feature = "freenet-main-contract", test))]
 pub(crate) fn summary_of(s: &RegState) -> Vec<u8> {
     let mut out = Vec::with_capacity(1 + 8 + 32 + 32);
     let d = s.record.as_ref().map(|r| r.decision());
@@ -92,6 +100,7 @@ pub(crate) fn summary_of(s: &RegState) -> Vec<u8> {
 /// Skipping those checks is safe precisely because they could not matter: a
 /// candidate that loses the decision order is discarded whether its signatures
 /// hold or not.
+#[cfg(any(feature = "freenet-main-contract", test, feature = "testing"))]
 fn absorb(held: &RegState, cand: RegState, p: &Params) -> RegState {
     let mut out = held.clone();
     if let Some(r) = cand.record {
@@ -165,8 +174,10 @@ pub mod cost {
     }
 }
 
+#[cfg(feature = "freenet-main-contract")]
 pub struct Register;
 
+#[cfg(feature = "freenet-main-contract")]
 #[contract]
 impl ContractInterface for Register {
     fn validate_state(
@@ -239,7 +250,7 @@ impl ContractInterface for Register {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "freenet-main-contract"))]
 mod tests {
     use super::*;
     use crate::testing::*;

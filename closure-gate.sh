@@ -88,13 +88,34 @@ for k in "${kinds[@]}"; do
   fi
 done
 
+# ------------------------------------------------ the register as a LIBRARY ----
+# craftworks-sdk reads RG01 through this crate's read/parse/verify (sdk#364), from crates that must not know the
+# client stack (its allowlist). So with NO default features the register crate must build, and link no
+# freenet-stdlib: the contract (the default feature) is the only user of it. A later edit that uses stdlib outside
+# the feature, or makes the dependency non-optional again, fails HERE, not in the SDK's gate.
+echo "closure-gate: register with --no-default-features must build and link no freenet-stdlib"
+if ( cd register && cargo check -q --no-default-features >/dev/null 2>&1 ); then
+  row "register --no-default-features" ok "cargo check --no-default-features builds"
+else
+  row "register --no-default-features" FAILED "cargo check --no-default-features does not build"
+fi
+lib_tree=$( cd register && cargo tree -e normal --no-default-features --prefix none 2>/dev/null || true )
+lib_n=$(printf '%s\n' "$lib_tree" | grep -c . || true)
+if [ "$lib_n" -lt 2 ]; then
+  row "register library closure" FAILED "only $lib_n package(s) in the tree; that is not a closure"
+elif printf '%s\n' "$lib_tree" | grep -qE "^freenet-stdlib v"; then
+  row "register library closure" FAILED "freenet-stdlib is in the no-default-features closure"
+else
+  row "register library closure" ok "$lib_n packages examined, no freenet-stdlib"
+fi
+
 echo
 [ "$checks" -gt 0 ] || { echo "closure-gate: 0 checks ran" >&2; exit 1; }
 if [ "$failures" -gt 0 ]; then
-  echo "closure-gate: $failures of $checks contract(s) FAILED"
+  echo "closure-gate: $failures of $checks check(s) FAILED"
   exit 1
 fi
-echo "closure-gate: $checks contract(s) clean: ${kinds[*]}"
+echo "closure-gate: $checks check(s) clean: contracts ${kinds[*]} + the register library"
 }
 
 # ---------------------------------------------------------------- control ----
@@ -156,8 +177,25 @@ EOF
   echo "== control 2: a DEV-dependency must still PASS =="
   # Undo control 1 and add it the way the contracts really would.
   git -C "$root" show HEAD:block/Cargo.toml > "$work/repo/block/Cargo.toml"
-  printf '\n[dev-dependencies]\ninstrument = { path = "../../instrument" }\n' >> "$work/repo/block/Cargo.toml"
+  # INTO the existing [dev-dependencies], as control 1 edits [dependencies]: appending a SECOND
+  # [dev-dependencies] header made the manifest invalid, cargo tree printed nothing, and this control failed
+  # on a defect of its own (it did on main before this fix).
+  python3 - "$work/repo/block/Cargo.toml" <<'EOF3'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+if "\n[dev-dependencies]\n" in s:
+    assert s.count("\n[dev-dependencies]\n") == 1
+    s = s.replace("\n[dev-dependencies]\n", "\n[dev-dependencies]\ninstrument = { path = \"../../instrument\" }\n", 1)
+else:
+    s += '\n[dev-dependencies]\ninstrument = { path = "../../instrument" }\n'
+open(p, "w").write(s)
+EOF3
   ( cd "$work/repo/block" && cargo generate-lockfile >/dev/null 2>&1 || true )
+  if ! ( cd "$work/repo/block" && cargo tree -e dev --prefix none 2>/dev/null ) | grep -qE "^instrument v"; then
+    echo "  FAILED  control 2 did not land — cargo does not see the dev-dependency"
+    exit 1
+  fi
   out=$( cd "$work/repo" && ./closure-gate.sh 2>&1 ) && rc=0 || rc=$?
   c=$((c + 1))
   if [ "$rc" -eq 0 ]; then
@@ -169,13 +207,39 @@ EOF
     printf '%s\n' "$out" | sed 's/^/          /'
   fi
 
+  echo "== control 3: freenet-stdlib NON-optional in register must make the gate FAIL =="
+  git -C "$root" show HEAD:block/Cargo.toml > "$work/repo/block/Cargo.toml"
+  ( cd "$work/repo/block" && cargo generate-lockfile >/dev/null 2>&1 || true )
+  python3 - "$work/repo/register/Cargo.toml" <<'EOF2'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+a = ', optional = true }'
+assert s.count(a) == 1, "no optional freenet-stdlib to undo"
+s = s.replace(a, ' }').replace('freenet-main-contract = ["dep:freenet-stdlib"]', 'freenet-main-contract = []')
+open(p, "w").write(s)
+EOF2
+  if ! ( cd "$work/repo/register" && cargo tree -e normal --no-default-features --prefix none 2>/dev/null ) | grep -qE "^freenet-stdlib v"; then
+    echo "  FAILED  the control did not land — stdlib is still not in the no-default closure"
+    exit 1
+  fi
+  out=$( cd "$work/repo" && ./closure-gate.sh 2>&1 ) && rc=0 || rc=$?
+  c=$((c + 1))
+  if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q "register library closure .*FAILED"; then
+    echo "  ok      the gate failed and named the register library closure"
+  else
+    f=$((f + 1))
+    echo "  FAILED  the gate did not fire (rc=$rc):"
+    printf '%s\n' "$out" | sed 's/^/          /'
+  fi
+
   echo
   if [ "$f" -gt 0 ]; then
     echo "self-test: $f of $c controls FAILED"
     exit 1
   fi
-  echo "self-test: $c controls passed — the gate fires on a normal dependency and"
-  echo "           permits a dev-dependency"
+  echo "self-test: $c controls passed — the gate fires on a normal dependency,"
+  echo "           permits a dev-dependency, and fires on a register that links stdlib without its feature"
 }
 
 if [ "${1:-}" = --self-test ]; then

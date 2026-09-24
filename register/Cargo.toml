@@ -13,7 +13,10 @@ description = "Register: one signed value per writer, key or k-of-n keyset. ARCH
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-freenet-stdlib = { version = "0.10.0", features = ["contract"] }
+# OPTIONAL, and enabled only by the contract feature (on by default, so the wasm build is unchanged): a crate using
+# this one as a LIBRARY (`default-features = false`: read/parse/verify, craftworks-sdk#364) links none of the client
+# stack. closure-gate.sh checks it.
+freenet-stdlib = { version = "0.10.0", features = ["contract"], optional = true }
 blake3 = { version = "1", default-features = false }
 # Pinned exactly, not by range: the wasm hash depends on this crate, and
 # `default-features = false` is what selects the full `S < L` scalar check over
@@ -30,7 +33,7 @@ sha2 = "0.10"
 
 [features]
 default = ["freenet-main-contract"]
-freenet-main-contract = []
+freenet-main-contract = ["dep:freenet-stdlib"]
 # Fixtures for the tests and for wasm-check. Off by default, so none of it is in
 # the contract's wasm.
 testing = []

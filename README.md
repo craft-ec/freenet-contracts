@@ -7,6 +7,7 @@ lockfile, because a contract's wasm hash is part of its network key.
 |---|---|---|
 | `block` | immutable, hash-keyed bytes | built |
 | `register` | one signed value per writer (key or k-of-n keyset) | built |
+| `tail` | a writer's live head and write buffer: the tree's root plus rows not yet flushed, moved by signed deltas (the Register's params and signature rules, as a library) | built, not released |
 | `set` | union of signed items, admitted by capability | built |
 | `bag` | unsigned immutable pointers, top-M by work | built |
 

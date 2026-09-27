@@ -309,6 +309,20 @@ impl Signed {
     }
 }
 
+/// The Tail contract reads and writes the same signed part (ARCHITECTURE.md §1, Tail): one encoding, one
+/// verifier. LIBRARY only, so register.wasm does not move.
+#[cfg(feature = "library")]
+impl Signed {
+    /// Bytes of an encoded `Signed` under this authority.
+    pub fn len_for(a: &Authority) -> usize {
+        Self::encoded_len(a)
+    }
+    /// Parse exactly one canonical encoding; no trailing bytes.
+    pub fn parse_for(b: &[u8], a: &Authority) -> Option<Signed> {
+        Self::parse(b, a)
+    }
+}
+
 /// Counts individual signature checks, so a test can assert that a candidate
 /// which cannot change the state costs a parse and no verification. Behind the
 /// `testing` feature, so the contract's wasm has neither the counter nor the

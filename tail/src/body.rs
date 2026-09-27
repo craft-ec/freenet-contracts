@@ -23,7 +23,8 @@ use std::collections::BTreeMap;
 pub const HASH_LEN: usize = 32;
 /// Largest encoded body. The tail is a buffer: past this the writer must flush before writing more.
 pub const MAX_BODY: usize = 256 * 1024;
-pub const MAX_KEY: usize = 1024;
+/// The tree's own key limit (freenet-prolly `node::MAX_KEY`): a row the tree cannot hold could never be flushed.
+pub const MAX_KEY: usize = 512;
 /// Largest value one entry may carry. Bigger values go in their own Block, and the entry carries the reference.
 pub const MAX_VALUE: usize = 64 * 1024;
 /// Most operations one delta may carry.
